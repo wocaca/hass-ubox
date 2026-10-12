@@ -33,3 +33,4 @@ schema:
   idle_timeout: int(15,600)
 ports_description:
   8089/tcp: Live MJPEG + snapshots + status
+image: ghcr.io/wocaca/{arch}-addon-ubox
