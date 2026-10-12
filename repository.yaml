@@ -1,11 +1,4 @@
-#!/bin/bash
-# strace找瘦rootfs缺的文件
-D=$(ls -dt /mnt/d/code/ubox/tmp/slimtest_* | head -1)
-cd "$D" || exit 1
-export LD_LIBRARY_PATH="$D"
-timeout 15 strace -f -e trace=%file qemu-aarch64-static -L /mnt/d/code/hass-ubox/ubox/rootfs ./rehost 2>&1 | grep ENOENT | sed 's/.*{}{
-  "name": "UBox Camera",
-  "description": "UBox camera live stream (pure local, on-demand)",
-  "url": "https://github.com/wocaca/hass-ubox",
-  "maintainer": "wocaca"
-}
+name: UBox Camera
+description: UBox camera live stream (pure local, on-demand)
+url: https://github.com/wocaca/hass-ubox
+maintainer: wocaca
