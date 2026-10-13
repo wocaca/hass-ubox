@@ -32,7 +32,9 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN fad6fedc write_package (account-level cap):
+          # use PAT secret instead (needs write:packages, this one has it).
+          password: ${{ secrets.GHCR_PAT }}
 
       - uses: docker/build-push-action@v6
         with:
