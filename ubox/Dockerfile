@@ -5,10 +5,11 @@ ENV LANG=C.UTF-8 \
     APP=/app \
     LD_LIBRARY_PATH=/app/bin
 
-# ffmpeg for H.265 -> MJPEG; qemu-user-static for the ARM64 rehost engine.
+# ffmpeg for H.265 -> MJPEG; qemu-user-static for the ARM64 rehost engine;
+# iptables for the relay/direct transport switch (needs NET_ADMIN).
 # Only qemu-aarch64-static is kept (rest of the package is purged).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates qemu-user-static \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates qemu-user-static iptables \
  && mkdir -p /tmp/qemusave \
  && cp /usr/bin/qemu-aarch64-static /tmp/qemusave/ \
  && apt-get purge -y qemu-user-static \

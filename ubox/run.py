@@ -8,7 +8,11 @@ Lifecycle: qemu spawns on the first /video.mjpg subscriber, killed after
 `idle_timeout` seconds with zero subscribers. Credentials come only from
 /data/options.json (never baked into the image).
 
-Endpoints: / (page), /video.mjpg, /snap.jpg, /stats
+Endpoints: / (page), /video.mjpg, /snap.jpg, /stats, /api/transport
+Transport: auto|relay|direct enforced via iptables (needs NET_ADMIN).
+  auto = no rules, lib picks; relay = drop LAN discovery (udp/32762);
+  direct = drop P4P relays (udp/20001). Effective path is lib-internal;
+  /stats reports the requested mode plus whether rules applied.
 """
 import glob
 import json
@@ -30,16 +34,33 @@ QEMU = os.path.join(BINDIR, "qemu-aarch64-static")
 REHOST = os.path.join(BINDIR, "rehost")
 FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 OPTFILE = "/data/options.json"
+TRANSPORT_FILE = "/data/transport"
+TRANSPORT_MODES = ("auto", "relay", "direct")
+# P4P relay port (every hardcoded relay) vs LAN discovery port
+# (broadcast + direct unicast signalling to the camera).
+RELAY_PORT = 20001
+LANDISC_PORT = 32762
+IPTABLES = shutil.which("iptables")
 
 NAL_RE = re.compile(rb"\x00\x00\x00\x01(.)", re.DOTALL)
 
 
 def load_options():
     opt = {"uid": "", "username": "admin", "password": "",
-           "stream": 1, "fps": 8, "port": 8089, "idle_timeout": 60}
+           "stream": 1, "fps": 8, "port": 8089, "idle_timeout": 60,
+           "transport": "auto"}
     try:
         with open(OPTFILE, encoding="utf-8") as fh:
             opt.update(json.load(fh))
+    except OSError:
+        pass
+    # Runtime choice from the web button survives restarts; it wins over
+    # the supervisor-managed options.json until the user changes config.
+    try:
+        with open(TRANSPORT_FILE, encoding="utf-8") as fh:
+            saved = fh.read().strip().lower()
+        if saved in TRANSPORT_MODES:
+            opt["transport"] = saved
     except OSError:
         pass
     for k in ("stream", "fps", "port", "idle_timeout"):
@@ -47,12 +68,76 @@ def load_options():
             opt[k] = int(os.environ.get("UBOX_" + k.upper(), opt[k]))
         except ValueError:
             pass
-    for k in ("uid", "username", "password"):
+    for k in ("uid", "username", "password", "transport"):
         opt[k] = os.environ.get("UBOX_" + k.upper(), opt[k])
+    if opt["transport"] not in TRANSPORT_MODES:
+        opt["transport"] = "auto"
     return opt
 
 
 OPT = load_options()
+
+TR = {"mode": OPT["transport"], "applied": False,
+      "detail": "not applied yet"}
+
+
+def _ipt(*args):
+    try:
+        p = subprocess.run(["iptables"] + list(args), capture_output=True,
+                           text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, str(e)[-200:]
+    out = ((p.stderr or "") + " " + (p.stdout or "")).strip()
+    return p.returncode, (out[-200:] if out else "ok")
+
+
+def _ipt_has(rule):
+    rc, _ = _ipt("-C", "OUTPUT", *rule)
+    return rc == 0
+
+
+def transport_rule(mode):
+    if mode == "relay":
+        # kill LAN discovery -> lib can only use public relays
+        return ["-p", "udp", "--dport", str(LANDISC_PORT),
+                "-m", "comment", "--comment", "ubox-transport"]
+    if mode == "direct":
+        # kill every P4P relay -> lib can only use the LAN path
+        return ["-p", "udp", "--dport", str(RELAY_PORT),
+                "-m", "comment", "--comment", "ubox-transport"]
+    return None
+
+
+def apply_transport(mode):
+    """Enforce relay/direct at the network layer. Returns applied bool."""
+    if mode not in TRANSPORT_MODES:
+        mode = "auto"
+    with LOCK:
+        TR["mode"] = mode
+    if not IPTABLES:
+        with LOCK:
+            TR["applied"] = False
+            TR["detail"] = "iptables missing: mode recorded, nothing enforced"
+        print("transport %s requested but iptables missing" % mode,
+              flush=True)
+        return False
+    for m in ("relay", "direct"):
+        _ipt("-D", "OUTPUT", *transport_rule(m))
+    rule = transport_rule(mode)
+    if rule is None:
+        with LOCK:
+            TR["applied"] = True
+            TR["detail"] = "auto: no firewall rules, lib picks path"
+        return True
+    rc, out = _ipt("-A", "OUTPUT", *rule)
+    ok = rc == 0 and _ipt_has(rule)
+    detail = ("drop udp/%s (%s-only)" % (rule[3], mode)) if ok \
+        else ("iptables failed: %s" % out)
+    with LOCK:
+        TR["applied"] = ok
+        TR["detail"] = detail
+    print("transport %s: %s" % (mode, detail), flush=True)
+    return ok
 
 ST = {"t0": time.time(), "decoded": 0, "nals": 0, "restarts": 0,
       "spawns": 0, "running": False, "served": 0, "subs": 0,
@@ -253,6 +338,9 @@ PAGE = """<!DOCTYPE html>
   #stage img { display:block; width:960px; max-width:96vw; background:#000; }
   #stats { margin-top:10px; font-size:13px; color:#9d9; font-family:monospace; }
   button { margin-top:10px; padding:8px 18px; font-size:14px; cursor:pointer; }
+  .row { margin-top:10px; font-size:13px; color:#aaa; }
+  .row button.on { border:2px solid #9d9; }
+  .warn { color:#f96; }
 </style>
 </head>
 <body>
@@ -261,12 +349,29 @@ PAGE = """<!DOCTYPE html>
 <div id="stage"><img id="v" src="/video.mjpg" alt="live"></div>
 <div id="stats">connecting...</div>
 <button onclick="var a=document.createElement('a');a.href='/snap.jpg?ts='+Date.now();a.download='ubox.jpg';document.body.appendChild(a);a.click();a.remove();">抓拍</button>
+<div class="row">传输：
+<button data-m="auto" onclick="setTr('auto')">自动</button><button data-m="relay" onclick="setTr('relay')">中继</button><button data-m="direct" onclick="setTr('direct')">直连</button>
+<span id="tr"></span></div>
+<div class="row">直连=封relay(:20001)只留局域网（同LAN才有画面）；中继=封局域网发现(:32762)走公网relay；自动=不封路lib自选。切换会重启取流约10秒。</div>
 <script>
+function setTr(m){
+  fetch('/api/transport?mode='+m,{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+    alert('传输='+d.mode+' 生效='+d.applied+' '+d.detail);
+  }).catch(function(){ alert('切换失败'); });
+}
 setInterval(function(){
   fetch('/stats').then(function(r){return r.json();}).then(function(s){
     document.getElementById('stats').textContent =
       (s.running?'LIVE':'idle')+' decoded='+s.decoded+' nals='+s.nals+
       ' subs='+s.subs+' spawns='+s.spawns+' uptime='+s.uptime_s+'s';
+    var t=document.getElementById('tr');
+    t.textContent='当前='+s.transport+' ('+s.transport_detail+')';
+    if(!s.transport_applied){ t.className='warn'; } else { t.className=''; }
+    var bs=document.querySelectorAll('button[data-m]');
+    for(var i=0;i<bs.length;i++){
+      if(bs[i].getAttribute('data-m')===s.transport){ bs[i].classList.add('on'); }
+      else { bs[i].classList.remove('on'); }
+    }
   }).catch(function(){});
 },2000);
 </script>
@@ -299,9 +404,13 @@ class Handler(BaseHTTPRequestHandler):
                 snap["last_age_ms"] = (
                     int((time.time() - LATEST["t"]) * 1000)
                     if LATEST["t"] else None)
+                tr = dict(TR)
             snap["uptime_s"] = int(time.time() - snap.pop("t0"))
             snap.pop("last_sub_t", None)
             snap["fps"] = OPT["fps"]
+            snap["transport"] = tr["mode"]
+            snap["transport_applied"] = tr["applied"]
+            snap["transport_detail"] = tr["detail"]
             self._send(200, "application/json",
                        json.dumps(snap).encode())
         elif path == "/snap.jpg":
@@ -350,11 +459,51 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found")
 
+    def do_POST(self):
+        path, _, qs = self.path.partition("?")
+        q = {}
+        for kv in qs.split("&"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                q[k] = v
+        if path == "/api/transport":
+            mode = (q.get("mode", "") or "").lower()
+            if mode not in TRANSPORT_MODES:
+                self._send(400, "application/json",
+                           json.dumps(
+                               {"error": "mode must be auto|relay|direct"}
+                           ).encode())
+                return
+            try:
+                with open(TRANSPORT_FILE, "w", encoding="utf-8") as fh:
+                    fh.write(mode)
+                persisted, perr = True, ""
+            except OSError as e:
+                # /data always exists in the add-on container; if not,
+                # still switch for this run and say so honestly.
+                persisted, perr = False, str(e)
+            OPT["transport"] = mode
+            ok = apply_transport(mode)
+            stop_pipeline()
+            WAKE.set()
+            with LOCK:
+                tr = dict(TR)
+            self._send(200, "application/json",
+                       json.dumps({"mode": mode, "applied": tr["applied"],
+                                   "detail": tr["detail"],
+                                   "persisted": persisted,
+                                   "persist_error": perr,
+                                   "restarted": True}).encode())
+        else:
+            self._send(404, "text/plain", b"not found")
+
 
 def main():
-    print("options: uid=%s.. stream=%d fps=%d idle=%ds" % (
+    print("options: uid=%s.. stream=%d fps=%d idle=%ds transport=%s" % (
         (OPT["uid"][:4] + "…") if OPT["uid"] else "(empty)",
-        OPT["stream"], OPT["fps"], OPT["idle_timeout"]), flush=True)
+        OPT["stream"], OPT["fps"], OPT["idle_timeout"],
+        OPT["transport"]), flush=True)
+    apply_transport(OPT["transport"])
     threading.Thread(target=supervisor, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", OPT["port"]), Handler)
     print("serving on :%d" % OPT["port"], flush=True)

@@ -1,5 +1,5 @@
 name: UBox Camera
-version: 0.1.0
+version: "0.2"
 slug: ubox
 description: UBox camera live H.265 stream, pure local, on-demand (starts qemu pipeline only while viewing)
 url: https://github.com/wocaca/hass-ubox
@@ -11,7 +11,8 @@ boot: auto
 host_network: true
 hassio_api: false
 homeassistant_api: false
-privileged: []
+privileged:
+  - NET_ADMIN
 full_access: false
 apparmor: true
 map: []
@@ -23,6 +24,7 @@ options:
   fps: 8
   port: 8089
   idle_timeout: 60
+  transport: auto
 schema:
   uid: str
   username: str
@@ -31,6 +33,7 @@ schema:
   fps: int(1,15)
   port: port
   idle_timeout: int(15,600)
+  transport: list(auto|relay|direct)
 ports_description:
   8089/tcp: Live MJPEG + snapshots + status
 image: ghcr.io/wocaca/{arch}-addon-ubox

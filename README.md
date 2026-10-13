@@ -6,7 +6,7 @@ UBox camera 实时 H.265 流，纯本地、按需取流：只在有人看时起 
 ## 安装
 
 1. HASS → 设置 → Add-ons → ⋮ → Repositories，加：
-   `https://github.com/wocaca/hass-ubox`
+   `https://github.com/wocaca/hass-ubox-0.1.0`
 2. 装 **UBox Camera**，配置里填 `uid` / `username`(admin) / `password`，
    `host_network` 已默认开启（UDP 打洞需要）。
 3. 启动后开 `http://<hass-ip>:8089/` 验证画面。
@@ -23,10 +23,24 @@ camera:
 
 缩略图走 `snap.jpg`（缓存帧，不唤醒取流）；点开卡片才连 `video.mjpg` 起流。
 
+## 传输切换（0.2+：中继/直连）
+
+真lib无transport参数，直连/中继是它按局域网可达性自动选的；本版用网络层强制 +
+页面按钮实现三态切换（切换约10秒重启取流）：
+
+- 自动：不封路，lib自选（默认）。
+- 中继：封局域网发现（UDP/32762），只能走公网relay（异地/跨网段用它）。
+- 直连：封全部P4P relay（UDP/20001），只留局域网（同LAN用它，跨网会黑屏）。
+
+页面上有 自动/中继/直连 三个按钮（`POST /api/transport?mode=`），当前模式与是否
+真正生效打在 `/stats`（`transport/transport_applied/transport_detail`）。生效需要
+容器 `NET_ADMIN` 特权（config已声明）；若环境不给特权，模式只记录不强制，
+页面黄字提示。
+
 ## 状态
 
 `/stats`：`running/decoded/nals/subs/spawns`，`subs=0` 超过 `idle_timeout`
-即停管线。
+即停管线；另有 `transport/transport_applied/transport_detail`。
 
 ## 结构
 
