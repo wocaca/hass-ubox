@@ -21,7 +21,7 @@ WORKDIR /app
 COPY rootfs /app/rootfs
 COPY bin /app/bin
 COPY run.py /app/run.py
-RUN chmod +x /app/bin/rehost \
+RUN chmod +x /app/bin/rehost /app/bin/rehost_sdlist \
  && cp /usr/bin/qemu-aarch64-static /app/bin/qemu-aarch64-static \
  && /app/bin/qemu-aarch64-static --version
 
