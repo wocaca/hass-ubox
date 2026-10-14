@@ -27,6 +27,9 @@ options:
   transport: auto
   http_username: ubox
   http_password: ""
+  cloud_account: ""
+  cloud_password: ""
+  cloud_region: us
 schema:
   uid: str
   username: str
@@ -38,6 +41,9 @@ schema:
   transport: list(auto|relay|direct)
   http_username: str
   http_password: password
+  cloud_account: str
+  cloud_password: password
+  cloud_region: list(cn|us|uni)
 ports_description:
   8089/tcp: Live MJPEG + snapshots + status
 image: ghcr.io/wocaca/{arch}-addon-ubox

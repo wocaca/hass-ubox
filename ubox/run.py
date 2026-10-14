@@ -8,7 +8,8 @@ Lifecycle: qemu spawns on the first /video.mjpg subscriber, killed after
 `idle_timeout` seconds with zero subscribers. Credentials come only from
 /data/options.json (never baked into the image).
 
-Endpoints: / (page), /video.mjpg, /snap.jpg, /stats, /api/transport
+Endpoints: / (page), /video.mjpg, /snap.jpg, /stats, /api/transport,
+  /api/login, /api/logout, /api/session, /api/devices (cloud passthrough).
 Transport: auto|relay|direct enforced via iptables (needs NET_ADMIN).
   auto = no rules, lib picks; relay = drop LAN discovery (udp/32762);
   direct = drop P4P relays (udp/20001). Effective path is lib-internal;
@@ -18,6 +19,7 @@ HTTP auth: options http_username/http_password; empty password = open
 """
 import base64
 import glob
+import hashlib
 import hmac
 import json
 import os
@@ -29,6 +31,8 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "/app"
@@ -52,7 +56,8 @@ NAL_RE = re.compile(rb"\x00\x00\x00\x01(.)", re.DOTALL)
 def load_options():
     opt = {"uid": "", "username": "admin", "password": "",
            "stream": 1, "fps": 8, "port": 8089, "idle_timeout": 60,
-           "transport": "auto", "http_username": "ubox", "http_password": ""}
+           "transport": "auto", "http_username": "ubox", "http_password": "",
+           "cloud_account": "", "cloud_password": "", "cloud_region": "us"}
     try:
         with open(OPTFILE, encoding="utf-8") as fh:
             opt.update(json.load(fh))
@@ -73,10 +78,13 @@ def load_options():
         except ValueError:
             pass
     for k in ("uid", "username", "password", "transport",
-                "http_username", "http_password"):
+                "http_username", "http_password",
+                "cloud_account", "cloud_password", "cloud_region"):
         opt[k] = os.environ.get("UBOX_" + k.upper(), opt[k])
     if opt["transport"] not in TRANSPORT_MODES:
         opt["transport"] = "auto"
+    if opt["cloud_region"] not in ("cn", "us", "uni"):
+        opt["cloud_region"] = "us"
     return opt
 
 
@@ -84,6 +92,104 @@ OPT = load_options()
 
 TR = {"mode": OPT["transport"], "applied": False,
       "detail": "not applied yet"}
+
+
+# ---- Cloud account (portal.ubianet.com passthrough, layout ported from
+# local :8080; stdlib only). Token persists in /data, never in the image.
+REGIONS = {
+    "cn": "https://portal-cn.ubianet.com",
+    "us": "https://portal-us.ubianet.com",
+    "uni": "https://portal-uni.ubianet.com",
+}
+CLOUD_SESSION_FILE = os.environ.get("UBOX_SESSION_FILE", "/data/session.json")
+_cloud_token = None
+_cloud_region = OPT.get("cloud_region") or "us"
+_cloud_account = ""
+
+
+def _save_cloud_session():
+    try:
+        with open(CLOUD_SESSION_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"token": _cloud_token, "region": _cloud_region,
+                       "account": _cloud_account,
+                       "saved_at": int(time.time())}, fh)
+        try:
+            os.chmod(CLOUD_SESSION_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _load_cloud_session():
+    global _cloud_token, _cloud_region, _cloud_account
+    try:
+        with open(CLOUD_SESSION_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if d.get("token"):
+            _cloud_token = d["token"]
+            if d.get("region") in REGIONS:
+                _cloud_region = d["region"]
+            _cloud_account = d.get("account", "")
+    except (OSError, ValueError):
+        pass
+
+
+def _clear_cloud_session():
+    global _cloud_token, _cloud_account
+    _cloud_token = None
+    _cloud_account = ""
+    try:
+        os.remove(CLOUD_SESSION_FILE)
+    except OSError:
+        pass
+
+
+def _app_password(pwd):
+    mac = hmac.new(b"", pwd.encode("utf-8"), hashlib.sha1).digest()
+    return base64.b64encode(mac).decode("ascii").replace(
+        "+", "-").replace("/", "_").replace("=", ",")
+
+
+def _cloud_call(path, body, token, base=None):
+    req = urllib.request.Request(
+        (base or REGIONS.get(_cloud_region, REGIONS["us"])) + path,
+        data=json.dumps(body).encode("utf-8"), method="POST")
+    req.add_header("X-Ubia-Auth-UserToken", token)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        try:
+            text = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+        return None, "HTTP %d: %s" % (e.code, text[:300])
+    except Exception as e:
+        return None, str(e)
+
+
+def _cloud_login(account, password, region):
+    global _cloud_token, _cloud_region, _cloud_account
+    if region in REGIONS:
+        _cloud_region = region
+    if not account or not password:
+        return None, "need account and password"
+    data = {"account": account, "password": _app_password(password),
+            "app": "ubox", "app_version": "1.1.370",
+            "brand": "android", "lang": "zh_CN", "device_type": 1}
+    resp, err = _cloud_call("/api/pub/account/login/v3", data, "",
+                            base=REGIONS[_cloud_region])
+    if err:
+        return None, err
+    token = (resp.get("data") or {}).get("Token")
+    if not token:
+        return None, "login failed: " + json.dumps(resp)[:300]
+    _cloud_token = token
+    _cloud_account = account
+    _save_cloud_session()
+    return token, None
 
 
 def _ipt(*args):
@@ -337,38 +443,121 @@ PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>UBox Camera</title>
 <style>
-  body { background:#111; color:#eee; font-family:system-ui,sans-serif; margin:0; padding:16px; }
+  *{box-sizing:border-box}
+  body { background:#141414; color:#eee; font-family:system-ui,sans-serif; margin:0; padding:16px; }
   h1 { font-size:20px; margin:0 0 4px; }
   .sub { color:#888; font-size:13px; margin-bottom:12px; }
-  #stage img { display:block; width:960px; max-width:96vw; background:#000; }
+  .card{background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:12px}
+  button{margin:4px 6px 4px 0;padding:7px 16px;font-size:14px;cursor:pointer;background:#2a6;color:#fff;border:none;border-radius:4px}
+  button:hover{background:#3b7}
+  button.danger{background:#a33}
+  input,select{padding:6px 10px;font-size:14px;background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:4px}
+  .navtabs{display:flex;gap:0;background:#1e1e1e;border:1px solid #333;border-radius:8px;overflow:hidden;margin-bottom:12px}
+  .navtabs button{flex:1;margin:0;padding:10px 0;font-size:15px;border:none;border-radius:0;background:transparent;color:#aaa}
+  .navtabs button.on{background:#2a6;color:#fff}
+  .tabpage{display:none}
+  .tabpage.on{display:block}
+  .dev-layout{display:flex;gap:12px;align-items:flex-start}
+  .dev-side{width:270px;flex:0 0 270px;display:flex;flex-direction:column;gap:12px}
+  .dev-side .card{margin-bottom:0}
+  .dev-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:0}
+  .dev-main .card{margin-bottom:12px}
+  @media (max-width:900px){.dev-layout{flex-direction:column}.dev-side{width:100%;flex:auto}}
+  #stage img { display:block; width:100%; max-width:960px; background:#000; border-radius:4px; }
   #stats { margin-top:10px; font-size:13px; color:#9d9; font-family:monospace; }
-  button { margin-top:10px; padding:8px 18px; font-size:14px; cursor:pointer; }
   .row { margin-top:10px; font-size:13px; color:#aaa; }
-  .row button.on { border:2px solid #9d9; }
+  .row button.on { outline:2px solid #9d9; }
   .warn { color:#f96; }
+  .muted{color:#666}
 </style>
 </head>
 <body>
 <h1>UBox Camera</h1>
 <div class="sub">on-demand &middot; qemu runs only while viewing</div>
-<div id="stage"><img id="v" src="/video.mjpg" alt="live"></div>
-<div id="stats">connecting...</div>
+<div class="navtabs" id="navtabs">
+  <button data-tab="live" class="on" onclick="switchTab('live')">直播</button>
+  <button data-tab="status" onclick="switchTab('status')">状态</button>
+  <button data-tab="cloud" onclick="switchTab('cloud')">云账户</button>
+</div>
+<div class="tabpage on" id="tab-live">
+<div class="dev-layout">
+<div class="dev-side">
+<div class="card">
 <button onclick="var a=document.createElement('a');a.href='/snap.jpg?ts='+Date.now();a.download='ubox.jpg';document.body.appendChild(a);a.click();a.remove();">抓拍</button>
 <div class="row">传输：
 <button data-m="auto" onclick="setTr('auto')">自动</button><button data-m="relay" onclick="setTr('relay')">中继</button><button data-m="direct" onclick="setTr('direct')">直连</button>
 <span id="tr"></span></div>
-<div class="row">直连=封relay(:20001)只留局域网（同LAN才有画面）；中继=封局域网发现(:32762)走公网relay；自动=不封路lib自选。切换会重启取流约10秒。</div>
+<div class="row muted">直连=封relay(:20001)只留局域网（同LAN才有画面）；中继=封局域网发现(:32762)走公网relay；自动=不封路lib自选。切换会重启取流约10秒。</div>
+</div>
+</div>
+<div class="dev-main">
+<div class="card">
+<div id="stage"><img id="v" src="/video.mjpg" alt="live"></div>
+<div id="stats">connecting...</div>
+</div>
+</div>
+</div>
+</div>
+<div class="tabpage" id="tab-status">
+<div class="card"><div id="stats2" class="muted">connecting...</div></div>
+</div>
+<div class="tabpage" id="tab-cloud">
+<div class="card" style="max-width:360px">
+<div style="margin-bottom:8px"><input id="c-account" type="email" placeholder="云账号" style="width:100%;padding:8px"></div>
+<div style="margin-bottom:8px"><input id="c-password" type="password" placeholder="密码" style="width:100%;padding:8px"></div>
+<div style="margin-bottom:8px"><select id="c-region" style="width:100%;padding:8px"><option value="us" selected>美国</option><option value="cn">中国</option><option value="uni">联通</option></select></div>
+<button onclick="doCloudLogin()" style="width:100%">登录</button>
+<button onclick="doCloudLogout()" class="danger" style="width:100%">退出登录</button>
+<div id="cloud-msg" class="muted" style="margin-top:6px"></div>
+</div>
+<div class="card"><div id="cloud-devs" class="muted">未登录</div></div>
+</div>
 <script>
+function switchTab(t){
+  var pages=document.querySelectorAll('.tabpage');
+  for(var i=0;i<pages.length;i++){ pages[i].classList.remove('on'); }
+  document.getElementById('tab-'+t).classList.add('on');
+  var bs=document.querySelectorAll('#navtabs button');
+  for(var j=0;j<bs.length;j++){
+    if(bs[j].getAttribute('data-tab')===t){ bs[j].classList.add('on'); }
+    else { bs[j].classList.remove('on'); }
+  }
+}
 function setTr(m){
   fetch('/api/transport?mode='+m,{method:'POST'}).then(function(r){return r.json();}).then(function(d){
     alert('传输='+d.mode+' 生效='+d.applied+' '+d.detail);
   }).catch(function(){ alert('切换失败'); });
 }
+function doCloudLogin(){
+  var b={account:document.getElementById('c-account').value,
+    password:document.getElementById('c-password').value,
+    region:document.getElementById('c-region').value};
+  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});}).then(function(x){
+    document.getElementById('cloud-msg').textContent=x.ok?('已登录 '+(x.d.account||'')):(x.d.error||'登录失败');
+    refreshCloud();
+  }).catch(function(){ document.getElementById('cloud-msg').textContent='登录失败'; });
+}
+function doCloudLogout(){
+  fetch('/api/logout',{method:'POST'}).then(function(){ document.getElementById('cloud-msg').textContent='已退出'; refreshCloud(); });
+}
+function refreshCloud(){
+  fetch('/api/session').then(function(r){return r.json();}).then(function(s){
+    if(!s.logged_in){ document.getElementById('cloud-devs').textContent='未登录'; return; }
+    document.getElementById('cloud-msg').textContent='已登录 '+(s.account||'')+' · '+s.region;
+    fetch('/api/devices').then(function(r){return r.json();}).then(function(d){
+      var items=(d.data&&d.data.items)||[];
+      document.getElementById('cloud-devs').textContent='共 '+items.length+' 台设备';
+    }).catch(function(){});
+  }).catch(function(){});
+}
+refreshCloud();
 setInterval(function(){
   fetch('/stats').then(function(r){return r.json();}).then(function(s){
     document.getElementById('stats').textContent =
       (s.running?'LIVE':'idle')+' decoded='+s.decoded+' nals='+s.nals+
       ' subs='+s.subs+' spawns='+s.spawns+' uptime='+s.uptime_s+'s';
+    document.getElementById('stats2').textContent =
+      document.getElementById('stats').textContent;
     var t=document.getElementById('tr');
     t.textContent='当前='+s.transport+' ('+s.transport_detail+')';
     if(!s.transport_applied){ t.className='warn'; } else { t.className=''; }
@@ -432,6 +621,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, "text/html; charset=utf-8",
                        PAGE.encode("utf-8"))
+        elif path == "/api/session":
+            self._send(200, "application/json",
+                       json.dumps(
+                           {"logged_in": bool(_cloud_token),
+                            "account": _cloud_account,
+                            "region": _cloud_region}).encode())
+        elif path == "/api/devices":
+            if not _cloud_token:
+                self._send(401, "application/json",
+                           json.dumps({"error": "not logged in"}).encode())
+                return
+            data, err = _cloud_call("/api/v2/user/device_list", {},
+                                    _cloud_token)
+            if err:
+                self._send(502, "application/json",
+                           json.dumps({"error": err}).encode())
+                return
+            self._send(200, "application/json",
+                       json.dumps(data).encode())
         elif path == "/stats":
             with LOCK:
                 snap = dict(ST)
@@ -493,6 +701,18 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found")
 
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > 65536:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8")) or {}
+        except Exception:
+            return {}
+
     def do_POST(self):
         if not self._auth_ok():
             self._deny_auth()
@@ -503,6 +723,25 @@ class Handler(BaseHTTPRequestHandler):
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 q[k] = v
+        if path == "/api/login":
+            body = self._read_json()
+            account = body.get("account") or OPT.get("cloud_account") or ""
+            password = body.get("password") or OPT.get("cloud_password") or ""
+            region = body.get("region") or OPT.get("cloud_region") or "us"
+            _, err = _cloud_login(account, password, region)
+            if err:
+                self._send(401, "application/json",
+                           json.dumps({"error": err}).encode())
+                return
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "account": _cloud_account,
+                                   "region": _cloud_region}).encode())
+            return
+        if path == "/api/logout":
+            _clear_cloud_session()
+            self._send(200, "application/json",
+                       json.dumps({"ok": True}).encode())
+            return
         if path == "/api/transport":
             mode = (q.get("mode", "") or "").lower()
             if mode not in TRANSPORT_MODES:
@@ -536,10 +775,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print("options: uid=%s.. stream=%d fps=%d idle=%ds transport=%s http_auth=%s" % (
+    _load_cloud_session()
+    print("options: uid=%s.. stream=%d fps=%d idle=%ds transport=%s http_auth=%s cloud=%s" % (
         (OPT["uid"][:4] + "…") if OPT["uid"] else "(empty)",
         OPT["stream"], OPT["fps"], OPT["idle_timeout"],
-        OPT["transport"], "on" if OPT.get("http_password") else "off"), flush=True)
+        OPT["transport"], "on" if OPT.get("http_password") else "off",
+        ("logged_in" if _cloud_token else "logged_out")), flush=True)
     apply_transport(OPT["transport"])
     threading.Thread(target=supervisor, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", OPT["port"]), Handler)
