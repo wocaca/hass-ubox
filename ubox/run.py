@@ -5,11 +5,12 @@ Pipeline: qemu-aarch64-static -L /app/rootfs /app/bin/rehost
   -> v_*.bin (Annex-B H.265 NALs) -> ffmpeg hevc pipe -> MJPEG.
 
 Lifecycle: qemu spawns on the first /video.mjpg subscriber, killed after
-`idle_timeout` seconds with zero subscribers. Credentials come only from
-/data/options.json (never baked into the image).
+`idle_timeout` seconds with zero subscribers. Device uid/password and cloud
+account are entered on the web page and kept in /data (never in options).
 
 Endpoints: / (page), /video.mjpg, /snap.jpg, /stats, /api/transport,
-  /api/login, /api/logout, /api/session, /api/devices (cloud passthrough).
+  /api/login, /api/logout, /api/session, /api/devices (cloud passthrough),
+  /api/device, /api/device-login (device credentials in /data).
 Transport: auto|relay|direct enforced via iptables (needs NET_ADMIN).
   auto = no rules, lib picks; relay = drop LAN discovery (udp/32762);
   direct = drop P4P relays (udp/20001). Effective path is lib-internal;
@@ -54,10 +55,12 @@ NAL_RE = re.compile(rb"\x00\x00\x00\x01(.)", re.DOTALL)
 
 
 def load_options():
-    opt = {"uid": "", "username": "admin", "password": "",
+    # Only non-secret runtime knobs live in Add-on options. Device uid /
+    # password and cloud account are entered on the web page and persisted
+    # under /data (never in options.json / the image).
+    opt = {"username": "admin",
            "stream": 1, "fps": 8, "port": 8089, "idle_timeout": 60,
-           "transport": "auto", "http_username": "ubox", "http_password": "",
-           "cloud_account": "", "cloud_password": "", "cloud_region": "us"}
+           "transport": "auto", "http_username": "ubox", "http_password": ""}
     try:
         with open(OPTFILE, encoding="utf-8") as fh:
             opt.update(json.load(fh))
@@ -77,14 +80,11 @@ def load_options():
             opt[k] = int(os.environ.get("UBOX_" + k.upper(), opt[k]))
         except ValueError:
             pass
-    for k in ("uid", "username", "password", "transport",
-                "http_username", "http_password",
-                "cloud_account", "cloud_password", "cloud_region"):
+    for k in ("username", "transport",
+                "http_username", "http_password"):
         opt[k] = os.environ.get("UBOX_" + k.upper(), opt[k])
     if opt["transport"] not in TRANSPORT_MODES:
         opt["transport"] = "auto"
-    if opt["cloud_region"] not in ("cn", "us", "uni"):
-        opt["cloud_region"] = "us"
     return opt
 
 
@@ -103,7 +103,7 @@ REGIONS = {
 }
 CLOUD_SESSION_FILE = os.environ.get("UBOX_SESSION_FILE", "/data/session.json")
 _cloud_token = None
-_cloud_region = OPT.get("cloud_region") or "us"
+_cloud_region = "us"
 _cloud_account = ""
 
 
@@ -190,6 +190,38 @@ def _cloud_login(account, password, region):
     _cloud_account = account
     _save_cloud_session()
     return token, None
+
+
+# ---- Device credentials (entered on the web page, persisted under /data).
+DEVICE_FILE = os.environ.get("UBOX_DEVICE_FILE", "/data/device.json")
+DEV = {"uid": os.environ.get("UBOX_UID", ""),
+       "username": os.environ.get("UBOX_USERNAME", ""),
+       "password": os.environ.get("UBOX_PASSWORD", "")}
+
+
+def _save_device():
+    try:
+        with open(DEVICE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"uid": DEV["uid"], "username": DEV["username"],
+                       "password": DEV["password"],
+                       "saved_at": int(time.time())}, fh)
+        try:
+            os.chmod(DEVICE_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _load_device():
+    try:
+        with open(DEVICE_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        for k in ("uid", "username", "password"):
+            if d.get(k):
+                DEV[k] = d[k]
+    except (OSError, ValueError):
+        pass
 
 
 def _ipt(*args):
@@ -359,17 +391,19 @@ def run_pipeline():
         except OSError:
             pass
     PIPE["rundir"] = rundir
-    if not OPT["uid"] or not OPT["password"]:
-        print("no uid/password in options, pipeline not started",
-              flush=True)
+    _load_device()
+    username = DEV["username"] or OPT.get("username") or "admin"
+    if not DEV["uid"] or not DEV["password"]:
+        print("no device uid/password (enter on web page), "
+              "pipeline not started", flush=True)
         return
     for need in (QEMU, REHOST):
         if not (os.path.isfile(need) and os.access(need, os.X_OK)):
             print("missing executable: %s" % need, flush=True)
             return
     cap = subprocess.Popen(
-        [QEMU, "-L", ROOTFS, REHOST, OPT["uid"], OPT["username"],
-         OPT["password"], "1", str(OPT["stream"]), "86400"],
+        [QEMU, "-L", ROOTFS, REHOST, DEV["uid"], username,
+         DEV["password"], "1", str(OPT["stream"]), "86400"],
         cwd=rundir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env={**os.environ, "LD_LIBRARY_PATH": BINDIR})
     ff = subprocess.Popen(
@@ -483,6 +517,13 @@ PAGE = """<!DOCTYPE html>
 <div class="dev-layout">
 <div class="dev-side">
 <div class="card">
+<div style="margin-bottom:8px"><input id="d-uid" placeholder="设备UID" style="width:100%;padding:8px"></div>
+<div style="margin-bottom:8px"><input id="d-user" placeholder="用户名（默认admin）" style="width:100%;padding:8px"></div>
+<div style="margin-bottom:8px"><input id="d-pass" type="password" placeholder="设备密码" style="width:100%;padding:8px"></div>
+<button onclick="saveDevice()" style="width:100%">保存设备并重启取流</button>
+<div id="dev-msg" class="muted" style="margin-top:6px"></div>
+</div>
+<div class="card">
 <button onclick="var a=document.createElement('a');a.href='/snap.jpg?ts='+Date.now();a.download='ubox.jpg';document.body.appendChild(a);a.click();a.remove();">抓拍</button>
 <div class="row">传输：
 <button data-m="auto" onclick="setTr('auto')">自动</button><button data-m="relay" onclick="setTr('relay')">中继</button><button data-m="direct" onclick="setTr('direct')">直连</button>
@@ -528,6 +569,22 @@ function setTr(m){
     alert('传输='+d.mode+' 生效='+d.applied+' '+d.detail);
   }).catch(function(){ alert('切换失败'); });
 }
+function saveDevice(){
+  var b={uid:document.getElementById('d-uid').value,
+    username:document.getElementById('d-user').value||'admin',
+    password:document.getElementById('d-pass').value};
+  fetch('/api/device-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});}).then(function(x){
+    document.getElementById('dev-msg').textContent=x.ok?('已保存 '+(x.d.uid||'')):(x.d.error||'保存失败');
+  }).catch(function(){ document.getElementById('dev-msg').textContent='保存失败'; });
+}
+function refreshDevice(){
+  fetch('/api/device').then(function(r){return r.json();}).then(function(d){
+    if(d.uid){ document.getElementById('d-uid').value=d.uid; }
+    if(d.username){ document.getElementById('d-user').value=d.username; }
+    document.getElementById('dev-msg').textContent=d.uid?('设备 '+(d.has_password?'已配密码':'未配密码')):'未配置设备';
+  }).catch(function(){});
+}
+refreshDevice();
 function doCloudLogin(){
   var b={account:document.getElementById('c-account').value,
     password:document.getElementById('c-password').value,
@@ -640,6 +697,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, "application/json",
                        json.dumps(data).encode())
+        elif path == "/api/device":
+            self._send(200, "application/json",
+                       json.dumps(
+                           {"uid": DEV["uid"],
+                            "username": DEV["username"]
+                            or OPT.get("username") or "admin",
+                            "has_password": bool(DEV["password"])}).encode())
         elif path == "/stats":
             with LOCK:
                 snap = dict(ST)
@@ -725,9 +789,9 @@ class Handler(BaseHTTPRequestHandler):
                 q[k] = v
         if path == "/api/login":
             body = self._read_json()
-            account = body.get("account") or OPT.get("cloud_account") or ""
-            password = body.get("password") or OPT.get("cloud_password") or ""
-            region = body.get("region") or OPT.get("cloud_region") or "us"
+            account = body.get("account") or ""
+            password = body.get("password") or ""
+            region = body.get("region") or "us"
             _, err = _cloud_login(account, password, region)
             if err:
                 self._send(401, "application/json",
@@ -736,6 +800,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json",
                        json.dumps({"ok": True, "account": _cloud_account,
                                    "region": _cloud_region}).encode())
+            return
+        if path == "/api/device-login":
+            body = self._read_json()
+            uid = (body.get("uid") or "").strip()
+            username = (body.get("username") or "admin").strip() or "admin"
+            password = body.get("password") or ""
+            if not uid or not password:
+                self._send(400, "application/json",
+                           json.dumps(
+                               {"error": "need uid and password"}).encode())
+                return
+            DEV["uid"] = uid
+            DEV["username"] = username
+            DEV["password"] = password
+            _save_device()
+            stop_pipeline()
+            WAKE.set()
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "uid": uid,
+                                   "username": username,
+                                   "restarted": True}).encode())
             return
         if path == "/api/logout":
             _clear_cloud_session()
@@ -776,11 +861,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     _load_cloud_session()
-    print("options: uid=%s.. stream=%d fps=%d idle=%ds transport=%s http_auth=%s cloud=%s" % (
-        (OPT["uid"][:4] + "…") if OPT["uid"] else "(empty)",
+    _load_device()
+    print("options: stream=%d fps=%d idle=%ds transport=%s http_auth=%s cloud=%s device=%s" % (
         OPT["stream"], OPT["fps"], OPT["idle_timeout"],
         OPT["transport"], "on" if OPT.get("http_password") else "off",
-        ("logged_in" if _cloud_token else "logged_out")), flush=True)
+        ("logged_in" if _cloud_token else "logged_out"),
+        ("set" if (DEV["uid"] and DEV["password"]) else "empty")),
+        flush=True)
     apply_transport(OPT["transport"])
     threading.Thread(target=supervisor, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", OPT["port"]), Handler)
