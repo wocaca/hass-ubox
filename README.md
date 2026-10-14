@@ -6,7 +6,7 @@ UBox camera 实时 H.265 流，纯本地、按需取流：只在有人看时起 
 ## 安装
 
 1. HASS → 设置 → Add-ons → ⋮ → Repositories，加：
-   `https://github.com/wocaca/hass-ubox-0.1.0`
+   `https://github.com/wocaca/hass-ubox`
 2. 装 **UBox Camera**，配置里填 `uid` / `username`(admin) / `password`，
    `host_network` 已默认开启（UDP 打洞需要）。
 3. 启动后开 `http://<hass-ip>:8089/` 验证画面。
