@@ -13,8 +13,12 @@ Transport: auto|relay|direct enforced via iptables (needs NET_ADMIN).
   auto = no rules, lib picks; relay = drop LAN discovery (udp/32762);
   direct = drop P4P relays (udp/20001). Effective path is lib-internal;
   /stats reports the requested mode plus whether rules applied.
+HTTP auth: options http_username/http_password; empty password = open
+  (backwards compatible), non-empty = every endpoint requires Basic auth.
 """
+import base64
 import glob
+import hmac
 import json
 import os
 import re
@@ -48,7 +52,7 @@ NAL_RE = re.compile(rb"\x00\x00\x00\x01(.)", re.DOTALL)
 def load_options():
     opt = {"uid": "", "username": "admin", "password": "",
            "stream": 1, "fps": 8, "port": 8089, "idle_timeout": 60,
-           "transport": "auto"}
+           "transport": "auto", "http_username": "ubox", "http_password": ""}
     try:
         with open(OPTFILE, encoding="utf-8") as fh:
             opt.update(json.load(fh))
@@ -68,7 +72,8 @@ def load_options():
             opt[k] = int(os.environ.get("UBOX_" + k.upper(), opt[k]))
         except ValueError:
             pass
-    for k in ("uid", "username", "password", "transport"):
+    for k in ("uid", "username", "password", "transport",
+                "http_username", "http_password"):
         opt[k] = os.environ.get("UBOX_" + k.upper(), opt[k])
     if opt["transport"] not in TRANSPORT_MODES:
         opt["transport"] = "auto"
@@ -386,6 +391,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _auth_ok(self):
+        want_u, want_p = OPT.get("http_username", ""), OPT.get("http_password", "")
+        if not want_p:
+            return True
+        got = self.headers.get("Authorization", "")
+        if not got.startswith("Basic "):
+            return False
+        try:
+            cred = base64.b64decode(got[6:].strip(), validate=True)
+        except (ValueError, base64.binascii.Error):
+            return False
+        expect = ("%s:%s" % (want_u, want_p)).encode("utf-8")
+        return hmac.compare_digest(cred, expect)
+
+    def _deny_auth(self):
+        body = b"auth required"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="ubox"')
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _send(self, code, ctype, body):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -394,6 +425,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._auth_ok():
+            self._deny_auth()
+            return
         path = self.path.split("?", 1)[0]
         if path == "/":
             self._send(200, "text/html; charset=utf-8",
@@ -460,6 +494,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
     def do_POST(self):
+        if not self._auth_ok():
+            self._deny_auth()
+            return
         path, _, qs = self.path.partition("?")
         q = {}
         for kv in qs.split("&"):
@@ -499,10 +536,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print("options: uid=%s.. stream=%d fps=%d idle=%ds transport=%s" % (
+    print("options: uid=%s.. stream=%d fps=%d idle=%ds transport=%s http_auth=%s" % (
         (OPT["uid"][:4] + "…") if OPT["uid"] else "(empty)",
         OPT["stream"], OPT["fps"], OPT["idle_timeout"],
-        OPT["transport"]), flush=True)
+        OPT["transport"], "on" if OPT.get("http_password") else "off"), flush=True)
     apply_transport(OPT["transport"])
     threading.Thread(target=supervisor, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", OPT["port"]), Handler)
