@@ -219,7 +219,10 @@ def _auto_login():
     if not creds:
         return False
     _, err = _cloud_login(*creds)
-    return not err
+    if err:
+        return False
+    _ensure_device_from_cloud(allow_pick=False)
+    return True
 
 
 def _cloud_token_dead(data, err):
@@ -362,6 +365,64 @@ def _resolve_device(uid):
     except Exception as e:
         return (None, None, "device resolve failed: %s" % str(e)[:120])
     return (None, None, "云端无此设备（uid 对不上，先进设备页刷新）")
+
+
+def _cloud_device_creds(data):
+    """Yield (uid, username, password, online, name) from device_list."""
+    d = (data.get("data", {}) or {}) if isinstance(data, dict) else {}
+    infos = {}
+    for inf in (d.get("infos", []) or []):
+        if isinstance(inf, dict) and inf.get("device_uid"):
+            infos[inf["device_uid"]] = inf
+    for it in (d.get("items", []) or []):
+        if not isinstance(it, dict):
+            continue
+        uid = it.get("device_uid") or it.get("uid") or ""
+        if not uid:
+            continue
+        inf = infos.get(uid, {}) or {}
+        dyn = inf.get("dynamic_info", {}) or {}
+        yield (uid,
+               inf.get("device_user", "") or it.get("device_user", "")
+               or "admin",
+               inf.get("device_pwd", "") or it.get("device_pwd", "") or "",
+               str(dyn.get("online_state", "")) in ("1", "2"),
+               it.get("name", "") or it.get("device_name", ""))
+
+
+def _ensure_device_from_cloud(allow_pick=True):
+    """Persist device.json from the cloud device list (best effort).
+
+    Called after (auto) login so a fresh container can stream with zero
+    manual device setup. Keeps the current DEV uid when still present
+    (refreshing its password); otherwise picks the first online device
+    with a password. With allow_pick=False only fills an empty DEV,
+    never switches a configured device. Never raises.
+    """
+    try:
+        _load_device()
+        data, err = _cloud_call_auto("/api/v2/user/device_list", {})
+        if err:
+            return None, "devices: %s" % err
+        cands = [c for c in _cloud_device_creds(data) if c[2]]
+        if not cands:
+            return None, "cloud devices have no password (enter on web page)"
+        if DEV["uid"] and DEV["password"]:
+            keep = next((c for c in cands if c[0] == DEV["uid"]), None)
+            if keep:
+                DEV["username"], DEV["password"] = keep[1], keep[2]
+                _save_device()
+                return keep[0], "kept %s" % keep[0]
+            if not allow_pick:
+                return None, "saved uid not in cloud list"
+        cands.sort(key=lambda c: (not c[3],))
+        uid, username, password = cands[0][:3]
+        nm = cands[0][4]
+        DEV["uid"], DEV["username"], DEV["password"] = uid, username, password
+        _save_device()
+        return uid, "picked %s%s" % (uid, (" (%s)" % nm) if nm else "")
+    except Exception as e:
+        return None, "device auto-save failed: %s" % str(e)[:120]
 
 
 # ---- Persistent P2P session (manual connect switch; SD list reuses it).
@@ -3831,9 +3892,18 @@ class Handler(BaseHTTPRequestHandler):
                            json.dumps({"error": err}).encode())
                 return
             _save_cloud_creds(account, password, region)
+            # 登录即配设备：从云设备表落 device.json，新容器零手动开流
+            _load_device()
+            olduid = DEV["uid"]
+            duid, dnote = _ensure_device_from_cloud(allow_pick=True)
+            if duid and duid != olduid:
+                _stop_all_branches()
+                _wake_all_branches()
             self._send(200, "application/json",
                        json.dumps({"ok": True, "account": _cloud_account,
-                                   "region": _cloud_region}).encode())
+                                   "region": _cloud_region,
+                                   "device_uid": duid,
+                                   "device_note": dnote}).encode())
             return
         if path == "/api/settings":
             body = self._read_json()
