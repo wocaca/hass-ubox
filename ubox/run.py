@@ -1087,6 +1087,41 @@ BR = {"1": _new_branch("1", "video1", "direct",
       "2": _new_branch("2", "video2", "relay",
                        "/tmp/ubox_run2", "/tmp/ubox_live_hls2")}
 LOCK = threading.Lock()
+
+# 画面角标：各分支 MJPEG 编码时烧进右上角（英文，DejaVu）。
+# 主备合并流逐帧取自两路，角标自动跟当前帧走；HLS(-c copy)/mp4 不重编码，无角标。
+OVERLAY_TAGS = {"1": "DIRECT video1", "2": "RELAY video2"}
+OVERLAY_FONTS = ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+_drawtext_probe = {"done": False, "ok": False, "font": ""}
+
+
+def _drawtext_vf(tag):
+    """drawtext vf fragment for the corner tag, or '' when unavailable.
+
+    Missing filter/font must never break the pipeline: probe once, fall
+    back to plain fps silently.
+    """
+    p = _drawtext_probe
+    if not p["done"]:
+        p["done"] = True
+        try:
+            r = subprocess.run([FFMPEG, "-hide_banner", "-h",
+                                "filter=drawtext"],
+                               capture_output=True, timeout=15)
+            has = r.returncode == 0
+        except Exception:
+            has = False
+        font = next((f for f in OVERLAY_FONTS if os.path.isfile(f)), "")
+        p["ok"], p["font"] = bool(has and font), font
+        if not p["ok"]:
+            print("overlay off (drawtext=%s font=%s)" % (has, font or "none"),
+                  flush=True)
+    if not p["ok"]:
+        return ""
+    safe = tag.replace("\\", "").replace(":", "\\:").replace("'", "")
+    return (",drawtext=fontfile=%s:text='%s':x=w-tw-10:y=10:fontsize=20"
+            ":fontcolor=white:box=1:boxcolor=black@0.6" % (p["font"], safe))
 SD_LOCK = threading.Lock()
 SD_RUN = {"running": False, "t0": 0}
 SD_RUNDIR = "/tmp/ubox_sd"
@@ -1908,10 +1943,11 @@ def run_pipeline(br):
         cwd=rundir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env={**os.environ, "LD_LIBRARY_PATH": BINDIR})
     branch_isolate(br, cap.pid)
+    vf = "fps=%d" % OPT["fps"] + _drawtext_vf(OVERLAY_TAGS[br["id"]])
     ff = subprocess.Popen(
         [FFMPEG, "-hide_banner", "-loglevel", "error",
          "-probesize", "32", "-f", "hevc", "-i", "pipe:0",
-         "-vf", "fps=%d" % OPT["fps"], "-q:v", "4",
+         "-vf", vf, "-q:v", "4",
          "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL)

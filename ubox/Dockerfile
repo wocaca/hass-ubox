@@ -9,7 +9,7 @@ ENV LANG=C.UTF-8 \
 # iptables for the relay/direct transport switch (needs NET_ADMIN).
 # Only qemu-aarch64-static is kept (rest of the package is purged).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates qemu-user-static iptables \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates qemu-user-static iptables fonts-dejavu-core \
  && mkdir -p /tmp/qemusave \
  && cp /usr/bin/qemu-aarch64-static /tmp/qemusave/ \
  && apt-get purge -y qemu-user-static \
