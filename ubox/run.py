@@ -3476,14 +3476,65 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, "image/jpeg", jpg)
         elif path == "/video.mjpg":
+            q = {}
+            for kv in (self.path.split("?", 1)[1]
+                       if "?" in self.path else "").split("&"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    q[k] = v
+            if q.get("check") == "1":
+                # 只检测不订阅：建联/管线状态秒回，不唤醒不计数
+                with LOCK:
+                    st = dict(ST)
+                    jpg_t = LATEST["t"]
+                now = time.time()
+                self._send(200, "application/json", json.dumps({
+                    "device_set": bool(DEV["uid"] and DEV["password"]),
+                    "pipeline_running": st["running"],
+                    "spawns": st["spawns"],
+                    "decoded": st["decoded"],
+                    "frame_age_ms": (int((now - jpg_t) * 1000)
+                                     if jpg_t else None),
+                    "subs": st["subs"],
+                    "transport": TR["mode"]}).encode())
+                return
             if not DEV["uid"] or not DEV["password"]:
                 self._send(503, "text/plain",
                            b"device not configured (enter on web page)")
                 return
+            WAKE.set()
+            # 预检：没建联/没管线就不干挂——等一等，25秒还不出帧
+            # 直接报原因（HA/浏览器看到的就是这段文字）
+            with LOCK:
+                warm = (ST["running"] and LATEST["jpg"] is not None
+                        and time.time() - LATEST["t"] < 5)
+            if not warm:
+                deadline = time.time() + 25
+                while time.time() < deadline:
+                    if client_gone(self.connection):
+                        return
+                    time.sleep(0.5)
+                    with LOCK:
+                        warm = (ST["running"]
+                                and LATEST["jpg"] is not None
+                                and time.time() - LATEST["t"] < 5)
+                    if warm:
+                        break
+            if not warm:
+                with LOCK:
+                    st = dict(ST)
+                self._send(503, "text/plain",
+                            ("no pipeline yet "
+                             "(device_set=True transport=%s spawns=%d "
+                             "decoded=%d subs=%d). "
+                             "wait for cold start, then retry; "
+                             "see /stats" % (
+                                 TR["mode"], st["spawns"],
+                                 st["decoded"], st["subs"])).encode())
+                return
             with LOCK:
                 ST["subs"] += 1
                 ST["last_sub_t"] = time.time()
-            WAKE.set()
             try:
                 bnd = "uboxlive"
                 self.send_response(200)
