@@ -1,5 +1,5 @@
 name: UBox Camera
-version: "0.5"
+version: "0.6"
 slug: ubox
 description: UBox camera live H.265 stream, pure local, on-demand (starts qemu pipeline only while viewing)
 url: https://github.com/wocaca/hass-ubox

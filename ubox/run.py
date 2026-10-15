@@ -145,6 +145,93 @@ def _clear_cloud_session():
         pass
 
 
+# ---- Saved cloud credentials (page login persists account+password under
+# /data so the cloud API stays logged in across restarts and auto re-logs
+# on token expiry. Explicit user choice (reverses the old never-store rule);
+# file is 0600, never in the image or repo.
+CLOUD_CREDS_FILE = os.environ.get("UBOX_CLOUD_CREDS_FILE",
+                                  "/data/cloud.json")
+_cloud_password = ""
+
+
+def _save_cloud_creds(account, password, region):
+    global _cloud_password
+    _cloud_password = password or ""
+    try:
+        with open(CLOUD_CREDS_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"account": account, "password": password,
+                       "region": region,
+                       "saved_at": int(time.time())}, fh)
+        try:
+            os.chmod(CLOUD_CREDS_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _load_cloud_creds():
+    global _cloud_password
+    try:
+        with open(CLOUD_CREDS_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if d.get("account") and d.get("password"):
+            _cloud_password = d["password"]
+            return (d["account"], d["password"], d.get("region") or "us")
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _has_saved_cloud_creds():
+    try:
+        with open(CLOUD_CREDS_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return bool(d.get("account") and d.get("password"))
+    except (OSError, ValueError):
+        return False
+
+
+def _clear_cloud_creds():
+    global _cloud_password
+    _cloud_password = ""
+    try:
+        os.remove(CLOUD_CREDS_FILE)
+    except OSError:
+        pass
+
+
+def _auto_login():
+    """One-shot login with saved creds. True on success, no loops."""
+    creds = _load_cloud_creds()
+    if not creds:
+        return False
+    _, err = _cloud_login(*creds)
+    return not err
+
+
+def _cloud_token_dead(data, err):
+    if err and (err.startswith("HTTP 401") or err.startswith("HTTP 403")):
+        return True
+    try:
+        return isinstance(data, dict) and data.get("code") == 10004
+    except Exception:
+        return False
+
+
+def _cloud_call_auto(path, body):
+    """Cloud call that survives token expiry: at most one re-login retry."""
+    if not _cloud_token and not _auto_login():
+        return None, "not logged in (auto login failed)"
+    data, err = _cloud_call(path, body, _cloud_token)
+    if _cloud_token_dead(data, err):
+        _clear_cloud_session()
+        if not _auto_login():
+            return None, "not logged in (auto login failed)"
+        data, err = _cloud_call(path, body, _cloud_token)
+    return data, err
+
+
 def _app_password(pwd):
     mac = hmac.new(b"", pwd.encode("utf-8"), hashlib.sha1).digest()
     return base64.b64encode(mac).decode("ascii").replace(
@@ -222,6 +309,579 @@ def _load_device():
                 DEV[k] = d[k]
     except (OSError, ValueError):
         pass
+
+
+def _resolve_device(uid):
+    """(username, password, err) for P2P paths (SD list/VOD/live).
+
+    Prefers cached DEV (device.json); falls back to the cloud device_list
+    (same source the live page uses) and persists what it finds, so a
+    fresh container works with zero manual device setup.
+    """
+    _load_device()
+    if DEV["uid"] == uid and DEV["password"]:
+        return (DEV["username"] or OPT.get("username") or "admin",
+                DEV["password"], None)
+    data, err = _cloud_call_auto("/api/v2/user/device_list", {})
+    if err:
+        return (None, None, err)
+    try:
+        d = (data.get("data", {}) or {})
+        infos = {}
+        for inf in (d.get("infos", []) or []):
+            if isinstance(inf, dict) and inf.get("device_uid"):
+                infos[inf["device_uid"]] = inf
+        for it in (d.get("items", []) or []):
+            if not isinstance(it, dict):
+                continue
+            if (it.get("device_uid") or it.get("uid")) != uid:
+                continue
+            inf = infos.get(uid, {}) or {}
+            pwd = inf.get("device_pwd", "") or ""
+            if not pwd:
+                return (None, None,
+                        "该设备云端无密码（进设备页手动填一次）")
+            username = (inf.get("device_user", "") or "admin")
+            DEV["uid"] = uid
+            DEV["username"] = username
+            DEV["password"] = pwd
+            _save_device()
+            return (username, pwd, None)
+    except Exception as e:
+        return (None, None, "device resolve failed: %s" % str(e)[:120])
+    return (None, None, "云端无此设备（uid 对不上，先进设备页刷新）")
+
+
+# ---- Persistent P2P session (manual connect switch; SD list reuses it).
+# One long-lived rehost_sdlist daemon (argv "daemon") holds the session;
+# LIST commands go through ./sess.cmd fifo, replies land as ioctl_*.bin
+# like one-shot mode. Idle auto-disconnect saves solar-battery power.
+SESS_DIR = "/tmp/ubox_sess"
+SESS_CMD = os.path.join(SESS_DIR, "sess.cmd")
+SESS_LOG = os.path.join(SESS_DIR, "sess.log")
+SESS_IDLE = 300
+SESS = {"proc": None, "running": False, "ready": False, "uid": "",
+        "t0": 0, "last": 0, "note": "", "tr": ""}
+SESS_LOCK = threading.Lock()
+SESS_CMD_LOCK = threading.Lock()
+
+
+def _sess_log_tail(n=200):
+    try:
+        with open(SESS_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            sz = fh.tell()
+            fh.seek(max(0, sz - 2000))
+            return fh.read().decode("utf-8", errors="replace")[-n:]
+    except OSError:
+        return ""
+
+
+def _sess_log_has(marker):
+    try:
+        with open(SESS_LOG, "rb") as fh:
+            return marker.encode() in fh.read()
+    except OSError:
+        return False
+
+
+def _sess_hs():
+    """Parse observed handshake params from the daemon log.
+
+    randomID (our login random), client_start ret (session handle ~ sid),
+    SESSION-READY via (which callback fired). Missing keys stay absent —
+    never fabricated.
+    """
+    try:
+        with open(SESS_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            sz = fh.tell()
+            fh.seek(max(0, sz - 6000))
+            log = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return {}
+    out = {}
+    m = re.search(r"randomID=(-?\d+)", log)
+    if m:
+        out["hs_random"] = m.group(1)
+    m = re.search(r"client_start ret=(-?\d+)", log)
+    if m:
+        out["hs_sid"] = m.group(1)
+    m = re.findall(r"SESSION-READY via (\S+)", log)
+    if m:
+        out["hs_ready_via"] = m[-1]
+    return out
+
+
+def sess_start(uid, username, password):
+    """Spawn the session daemon; wait for SESSION-READY (cap 40s)."""
+    with SESS_LOCK:
+        p = SESS.get("proc")
+        if p is not None and p.poll() is None:
+            if SESS["uid"] == uid:
+                SESS["last"] = int(time.time())
+                return True, "already connected"
+            return False, "另一设备已建联（先断开）"
+        sess_stop_locked()
+        try:
+            os.makedirs(SESS_DIR, exist_ok=True)
+            for f in glob.glob(os.path.join(SESS_DIR, "*")):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            os.mkfifo(SESS_CMD)
+        except OSError as e:
+            return False, "sess dir fail: %s" % e
+        sdbin = os.path.join(BINDIR, "rehost_sdlist")
+        if not (os.path.isfile(QEMU) and os.access(QEMU, os.X_OK)):
+            return False, "missing executable: %s" % QEMU
+        if not (os.path.isfile(sdbin) and os.access(sdbin, os.X_OK)):
+            return False, "SD P2P未接入（镜像缺rehost_sdlist）"
+        try:
+            logfh = open(SESS_LOG, "wb")
+        except OSError as e:
+            return False, "sess log fail: %s" % e
+        try:
+            p = subprocess.Popen(
+                [QEMU, "-L", ROOTFS, sdbin, uid, username, password,
+                 "1", "1", "daemon"],
+                cwd=SESS_DIR, stdout=logfh, stderr=subprocess.STDOUT,
+                env={**os.environ, "LD_LIBRARY_PATH": BINDIR})
+        except Exception as e:
+            try:
+                logfh.close()
+            except Exception:
+                pass
+            return False, "sess spawn failed: %s" % str(e)[:120]
+        SESS.update(proc=p, running=True, ready=False, uid=uid,
+                    t0=int(time.time()), last=int(time.time()), note="",
+                    tr=TR["mode"])
+    for _ in range(40):
+        time.sleep(1)
+        if p.poll() is not None:
+            with SESS_LOCK:
+                SESS.update(running=False, ready=False,
+                            note="daemon过早退出")
+            return False, "daemon过早退出（见sess.log）"
+        if _sess_log_has("SESSION-READY"):
+            with SESS_LOCK:
+                SESS["ready"] = True
+                SESS["last"] = int(time.time())
+            return True, "connected"
+    return False, "建联超时（40秒无SESSION-READY）"
+
+
+def sess_stop_locked():
+    p = SESS.get("proc")
+    SESS.update(proc=None, running=False, ready=False, note="")
+    if p is None:
+        return
+    if p.poll() is None:
+        try:
+            with open(SESS_CMD, "w") as fh:
+                fh.write("QUIT\n")
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=8)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def sess_stop(auto=False):
+    with SESS_LOCK:
+        was = SESS["running"]
+        sess_stop_locked()
+        if auto and was:
+            SESS["note"] = "闲置自动断开"
+    return was
+
+
+def sess_status():
+    with SESS_LOCK:
+        p = SESS.get("proc")
+        alive = p is not None and p.poll() is None
+        if not alive:
+            if SESS["running"]:
+                SESS["note"] = "daemon已退出"
+            SESS.update(proc=None, running=False, ready=False)
+        now = int(time.time())
+        up = alive and SESS["running"]
+        idle_left = (max(0, SESS_IDLE - (now - (SESS["last"] or now)))
+                     if up else 0)
+        return {"up": up, "ready": SESS["ready"] and alive,
+                "uid": SESS["uid"] if up else "",
+                "uptime_s": (now - SESS["t0"]) if (up and SESS["t0"]) else 0,
+                "idle_left_s": idle_left, "note": SESS["note"],
+                "sess_tr": SESS.get("tr", ""),
+                "hs": _sess_hs(),
+                "log_tail": _sess_log_tail()}
+
+
+def sess_usable(uid):
+    """Daemon reusable for uid right now (up+ready+same uid+same transport)."""
+    st = sess_status()
+    with LOCK:
+        trmode = TR["mode"]
+    return (st["up"] and st["ready"] and st["uid"] == uid
+            and (st.get("sess_tr") or "") == trmode)
+
+
+def _sess_send_cmd(cmd):
+    """Write one command line to the daemon fifo."""
+    try:
+        with open(SESS_CMD, "w") as fh:
+            fh.write(cmd + "\n")
+        return None
+    except OSError as e:
+        return "会话命令失败：%s" % e
+
+
+def sess_supervisor():
+    while True:
+        time.sleep(10)
+        try:
+            with SESS_LOCK:
+                p = SESS.get("proc")
+                overdue = (p is not None and p.poll() is None
+                           and SESS["running"]
+                           and int(time.time()) - (SESS["last"] or 0)
+                           > SESS_IDLE)
+        except Exception:
+            overdue = False
+        if overdue:
+            sess_stop(auto=True)
+
+
+def sess_cmd_list(uid, start, end, timeout=60):
+    """LIST through the daemon. Same return shape as run_sdlist."""
+    t0 = int(time.time())
+    with SESS_LOCK:
+        p = SESS.get("proc")
+        if p is None or p.poll() is not None or not SESS["ready"]:
+            return {"error": "未建联（先点建联）", "events": []}, 503
+        if SESS["uid"] != uid:
+            return {"error": "设备不一致（先断开重建）", "events": []}, 409
+        try:
+            before = set(glob.glob(os.path.join(SESS_DIR,
+                                                "ioctl_257_*.bin")))
+        except Exception:
+            before = set()
+    if not SESS_CMD_LOCK.acquire(timeout=15):
+        return {"error": "会话忙（稍后再试）", "events": []}, 409
+    try:
+        err = _sess_send_cmd("LIST %d %d" % (start, end))
+        if err:
+            return {"error": err, "events": []}, 500
+        with SESS_LOCK:
+            SESS["last"] = int(time.time())
+        deadline = time.time() + timeout
+        hit, last_sz, stable = None, -1, 0
+        while time.time() < deadline:
+            try:
+                now = set(glob.glob(os.path.join(SESS_DIR,
+                                                 "ioctl_257_*.bin")))
+            except Exception:
+                now = set()
+            new = sorted(now - before)
+            if new:
+                try:
+                    sz = os.path.getsize(new[0])
+                except OSError:
+                    sz = -1
+                if sz == last_sz and sz > 0:
+                    stable += 1
+                    if stable >= 2:
+                        hit = new[0]
+                        break
+                else:
+                    stable = 0
+                last_sz = sz
+            time.sleep(1)
+    finally:
+        SESS_CMD_LOCK.release()
+    if hit is None:
+        return {"error": "camera无0x101回包（SD卡可能未插/离线）",
+                "uid": uid, "window": [start, end],
+                "via": "sess-daemon", "events": []}, 502
+    info = parse_sdlist(hit)
+    with LOCK:
+        trmode = TR["mode"]
+    info.update({
+        "uid": uid, "window": [start, end], "via": "sess-daemon",
+        "elapsed": int(time.time()) - t0,
+        "source": {"relay": "p2p-relay", "direct": "p2p-lan"}.get(
+            trmode, "p2p-auto"),
+    })
+    return info, 200
+
+
+def sess_cmd_play(uid, evstart, reqseq=3, timeout=30):
+    """PLAY through the daemon. Returns (stream_path, err)."""
+    with SESS_LOCK:
+        p = SESS.get("proc")
+        if p is None or p.poll() is not None or not SESS["ready"]:
+            return None, "未建联（先点建联）"
+        if SESS["uid"] != uid:
+            return None, "设备不一致（先断开重建）"
+        try:
+            before = set(glob.glob(os.path.join(SESS_DIR, "stream_*.bin")))
+        except Exception:
+            before = set()
+    if not SESS_CMD_LOCK.acquire(timeout=15):
+        return None, "会话忙（稍后再试）"
+    try:
+        err = _sess_send_cmd("PLAY %d %d" % (evstart, reqseq))
+        if err:
+            return None, err
+        with SESS_LOCK:
+            SESS["last"] = int(time.time())
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                now = set(glob.glob(os.path.join(SESS_DIR, "stream_*.bin")))
+            except Exception:
+                now = set()
+            new = sorted(now - before)
+            if new:
+                return new[0], None
+            time.sleep(1)
+        return None, "点播无流（PLAY后30秒无帧文件）"
+    finally:
+        SESS_CMD_LOCK.release()
+
+
+def sess_cmd_seek():
+    """SEEK (AVCMD 7) through the daemon. Best-effort, returns err/None."""
+    if not SESS_CMD_LOCK.acquire(timeout=15):
+        return "会话忙（稍后再试）"
+    try:
+        err = _sess_send_cmd("SEEK")
+        if err:
+            return err
+        with SESS_LOCK:
+            SESS["last"] = int(time.time())
+        return None
+    finally:
+        SESS_CMD_LOCK.release()
+
+
+def sess_cmd_stopvod():
+    """STOPVOD through the daemon. Best-effort, returns err/None."""
+    if not SESS_CMD_LOCK.acquire(timeout=15):
+        return "会话忙（稍后再试）"
+    try:
+        err = _sess_send_cmd("STOPVOD")
+        if err:
+            return err
+        with SESS_LOCK:
+            SESS["last"] = int(time.time())
+        return None
+    finally:
+        SESS_CMD_LOCK.release()
+
+
+def run_sd_vod_daemon(uid, start, length, reqseq=3):
+    """VOD over the persistent session: PLAY -> HLS live -> STOPVOD -> mp4.
+
+    Same outputs as run_sd_vod (HLS dir + mp4), no new handshake. Holds
+    SESS_CMD_LOCK for the whole play so LIST waits its turn.
+    """
+    length = max(1, min(600, int(length or 60)))
+    secs = min(45 + length * 2, 400)
+    try:
+        reqseq = int(reqseq or 3) & 0xFFFF
+    except (TypeError, ValueError):
+        reqseq = 3
+    os.makedirs(VODDIR, exist_ok=True)
+    mp4 = os.path.join(VODDIR, "回放_%s.mp4" % start)
+    h265 = os.path.join(VODDIR, "回放_%s.h265" % start)
+    hlsdir = os.path.join(VODDIR, "hls_%s" % start)
+    try:
+        os.makedirs(hlsdir, exist_ok=True)
+    except OSError:
+        pass
+    with VOD_LOCK:
+        VOD_RUN["hls_dir"] = hlsdir
+        VOD_RUN["hls_ready"] = _vod_hls_ready(hlsdir)
+    if os.path.isfile(mp4) and os.path.getsize(mp4) > 0:
+        _vod_log("cache hit: " + os.path.basename(mp4))
+        with VOD_LOCK:
+            VOD_RUN["mp4"] = mp4
+        return mp4
+    if not SESS_CMD_LOCK.acquire(timeout=20):
+        _vod_log("会话忙，点播放弃")
+        return None
+    fifo = os.path.join(hlsdir, "in.hevc")
+    ff = None
+    fifo_w = None
+    try:
+        _vod_log("+ vod(sess) start=%s len=%d secs=%d" % (
+            start, length, secs))
+        try:
+            before = set(glob.glob(os.path.join(SESS_DIR, "stream_*.bin")))
+        except Exception:
+            before = set()
+        err = _sess_send_cmd("PLAY %d %d" % (start, reqseq))
+        if err:
+            _vod_log("PLAY失败：%s" % err)
+            return None
+        t_play = time.time()
+        with SESS_LOCK:
+            SESS["last"] = int(time.time())
+        spath = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                now = set(glob.glob(os.path.join(SESS_DIR, "stream_*.bin")))
+            except Exception:
+                now = set()
+            new = sorted(now - before)
+            if new:
+                spath = new[0]
+                break
+            time.sleep(1)
+        if spath is None:
+            _vod_log("点播无流（PLAY后30秒无帧文件）")
+            return None
+        _vod_log("vod stream: %s" % os.path.basename(spath))
+        try:
+            os.remove(fifo)
+        except OSError:
+            pass
+        try:
+            os.mkfifo(fifo)
+        except (OSError, AttributeError) as e:
+            _vod_log("fifo失败：%s" % str(e)[:80])
+            return None
+        try:
+            ff = subprocess.Popen(
+                [FFMPEG, "-hide_banner", "-loglevel", "error",
+                 "-r", "30", "-f", "hevc", "-i", fifo,
+                 "-c", "copy", "-f", "hls", "-hls_time", "2",
+                 "-hls_list_size", "0", "-hls_playlist_type", "event",
+                 "-hls_segment_type", "fmp4",
+                 "-hls_fmp4_init_filename", "init.mp4",
+                 "-hls_segment_filename", "seg%d.m4s", "index.m3u8"],
+                cwd=hlsdir, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
+            fifo_w = open(fifo, "wb")
+        except Exception as e:
+            _vod_log("ffmpeg HLS启动失败：%s" % str(e)[:80])
+            return None
+        st = {"off": 0, "pend": b""}
+        tnv, tbytes = 0, 0
+        firstv_t, sentseek = None, False
+        end_t = time.time() + secs
+        last_ready = False
+        while time.time() < end_t:
+            nv, nb = _vod_forward_frames(spath, fifo_w, st)
+            tnv += nv
+            tbytes += nb
+            try:
+                fifo_w.flush()
+            except Exception:
+                break
+            if tnv > 0 and firstv_t is None:
+                firstv_t = time.time()
+                _vod_log("first video +%.0fs" % (firstv_t - t_play))
+            if (not sentseek and firstv_t is not None
+                    and time.time() - firstv_t >= 5):
+                serr = _sess_send_cmd("SEEK")
+                sentseek = True
+                _vod_log("SEEK %s" % ("ok" if not serr else serr))
+            ready = _vod_hls_ready(hlsdir)
+            if ready and not last_ready:
+                last_ready = True
+                with VOD_LOCK:
+                    VOD_RUN["hls_ready"] = True
+                _vod_log("hls playable +%ds: %d arrays %dB" % (
+                    int(time.time() - t_play), tnv, tbytes))
+            with SESS_LOCK:
+                SESS["last"] = int(time.time())
+            time.sleep(1)
+        serr = _sess_send_cmd("STOPVOD")
+        _vod_log("STOPVOD %s" % ("ok" if not serr else serr))
+        try:
+            fifo_w.close()
+        except Exception:
+            pass
+        fifo_w = None
+        if ff is not None:
+            try:
+                _, fferr = ff.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                try:
+                    ff.kill()
+                except Exception:
+                    pass
+                _, fferr = ff.communicate()
+            except Exception as e:
+                fferr = str(e).encode("utf-8", errors="replace")
+            if fferr:
+                _vod_log("ffmpeg hls: %s"
+                         % fferr.decode("utf-8",
+                                        errors="replace")[-200:])
+            _vod_log("hls done: segs=%d arrays=%d bytes=%d" % (
+                _vod_hls_segs(hlsdir), tnv, tbytes))
+            with VOD_LOCK:
+                VOD_RUN["hls_ready"] = _vod_hls_ready(hlsdir)
+    except Exception as e:
+        _vod_log("VOD(sess)异常：%s" % str(e)[:120])
+        return None
+    finally:
+        try:
+            SESS_CMD_LOCK.release()
+        except Exception:
+            pass
+        if fifo_w is not None:
+            try:
+                fifo_w.close()
+            except Exception:
+                pass
+        if fifo is not None:
+            try:
+                os.remove(fifo)
+            except OSError:
+                pass
+    try:
+        with open(spath, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        _vod_log("no stream produced")
+        return None
+    if not d:
+        _vod_log("no stream produced")
+        return None
+    try:
+        with open(VODDIR + "/stream.bin", "wb") as fh:
+            fh.write(d)
+        nv, na, nb = vod_extract(VODDIR + "/stream.bin", h265)
+    except OSError as e:
+        _vod_log("stream拷贝失败：%s" % str(e)[:80])
+        return None
+    _vod_log("extract: video=%d other=%d bytes=%d" % (nv, na, nb))
+    if nb == 0:
+        _vod_log("无视频帧")
+        return None
+    try:
+        r = subprocess.run(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+             "-r", "30", "-f", "hevc", "-i", h265, "-c", "copy", mp4],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=300)
+        _vod_log("mp4: %s rc=%d" % (os.path.basename(mp4), r.returncode))
+        if r.returncode == 0 and os.path.isfile(mp4):
+            with VOD_LOCK:
+                VOD_RUN["mp4"] = mp4
+            return mp4
+    except Exception as e:
+        _vod_log("ffmpeg失败：%s" % str(e)[:120])
+    return None
 
 
 # ---- Runtime settings (page-driven, persisted under /data).
@@ -326,10 +986,13 @@ def apply_transport(mode):
 
 ST = {"t0": time.time(), "decoded": 0, "nals": 0, "restarts": 0,
       "spawns": 0, "running": False, "served": 0, "subs": 0,
-      "last_sub_t": 0.0}
+      "last_sub_t": 0.0, "hls_n": 0, "hls_bytes": 0, "hls_err": ""}
 LATEST = {"jpg": None, "seq": 0, "t": 0.0}
 LOCK = threading.Lock()
-PIPE = {"cap": None, "ff": None, "rundir": ""}
+PIPE = {"cap": None, "ff": None, "rundir": "", "hls": None,
+        "hlsfifo": None, "hlslog": None}
+HLSDIR = "/tmp/ubox_live_hls"
+PRIME = {"on": False, "nxt": 0}
 WAKE = threading.Event()
 SD_LOCK = threading.Lock()
 SD_RUN = {"running": False, "t0": 0}
@@ -555,12 +1218,87 @@ def vod_extract(src, dst):
     return nv, na, len(out)
 
 
-def run_sd_vod(uid, username, password, start, length, reqseq=3):
-    """Blocking VOD job: rehost_sdlist vod-stream -> mp4.
+def _vod_log(msg):
+    with VOD_LOCK:
+        VOD_RUN["log"].append(msg)
 
-    Runs qemu (secs=45+len*2, capped 400s), extracts stream.bin to H.265,
-    ffmpeg -c copy to VODDIR/回放_<start>.mp4. Updates VOD_RUN log/mp4.
-    Returns mp4 path or None.
+
+def _vod_hls_ready(hlsdir):
+    """True once the playlist references a segment (playable now)."""
+    idx = os.path.join(hlsdir, "index.m3u8")
+    try:
+        if os.path.getsize(idx) <= 0:
+            return False
+        with open(idx, "rb") as fh:
+            return b".m4s" in fh.read()
+    except OSError:
+        return False
+
+
+def _vod_hls_segs(hlsdir):
+    try:
+        return len(glob.glob(os.path.join(hlsdir, "seg*.m4s")))
+    except Exception:
+        return 0
+
+
+def _vod_forward_frames(stream, fifo_w, st=None):
+    """Tail stream.bin ([len:4][magic][data]) -> fifo (Annex-B video only).
+
+    Returns (video_arrays, bytes). st holds (off, pend) across polls;
+    defaults to a shared dict (one-shot path). Daemon-VOD passes its own.
+    Handles qemu truncating stream.bin at PLAY_START.
+    """
+    import struct as _st
+    if st is None:
+        st = _vod_forward_frames.__dict__.setdefault("st", {})
+    off = st.get("off", 0)
+    pend = st.get("pend", b"")
+    try:
+        size = os.path.getsize(stream)
+    except OSError:
+        return 0, 0
+    if size < off:
+        off, pend = 0, b""
+    try:
+        with open(stream, "rb") as fh:
+            fh.seek(off)
+            chunk = fh.read()
+    except OSError:
+        return 0, 0
+    if not chunk and not pend:
+        st["off"], st["pend"] = off, pend
+        return 0, 0
+    data = pend + chunk
+    nv, sent, pos = 0, 0, 0
+    while pos + 8 <= len(data):
+        (ln,) = _st.unpack("<I", data[pos:pos + 4])
+        if ln <= 0 or ln > 2000000:
+            break
+        if pos + 8 + ln > len(data):
+            break
+        payload = data[pos + 8:pos + 8 + ln]
+        if payload[:4] == b"\x00\x00\x00\x01":
+            try:
+                fifo_w.write(payload)
+                nv += 1
+                sent += len(payload)
+            except (BrokenPipeError, ValueError, OSError):
+                break
+        pos += 8 + ln
+    st["off"] = off + pos
+    st["pend"] = data[pos:]
+    return nv, sent
+
+
+def run_sd_vod(uid, username, password, start, length, reqseq=3):
+    """Blocking VOD job: rehost_sdlist vod-stream -> HLS (live) + mp4.
+
+    qemu runs under Popen; arrived frames are tailed from stream.bin into
+    a FIFO read by ffmpeg, which cuts fmp4 HLS (event playlist) into
+    VODDIR/hls_<start>/ — playable via /api/sd/hls while still
+    downloading. When qemu ends, the FIFO closes, ffmpeg finalizes, and
+    the classic stream.bin -> mp4 (-c copy) is built as fallback/download.
     """
     length = max(1, min(600, int(length or 60)))
     secs = min(45 + length * 2, 400)
@@ -578,6 +1316,14 @@ def run_sd_vod(uid, username, password, start, length, reqseq=3):
             pass
     mp4 = os.path.join(VODDIR, "回放_%s.mp4" % start)
     h265 = os.path.join(VODDIR, "回放_%s.h265" % start)
+    hlsdir = os.path.join(VODDIR, "hls_%s" % start)
+    try:
+        os.makedirs(hlsdir, exist_ok=True)
+    except OSError:
+        pass
+    with VOD_LOCK:
+        VOD_RUN["hls_dir"] = hlsdir
+        VOD_RUN["hls_ready"] = _vod_hls_ready(hlsdir)
     if os.path.isfile(mp4) and os.path.getsize(mp4) > 0:
         with VOD_LOCK:
             VOD_RUN["log"].append("cache hit: " + os.path.basename(mp4))
@@ -594,24 +1340,135 @@ def run_sd_vod(uid, username, password, start, length, reqseq=3):
     with VOD_LOCK:
         VOD_RUN["log"].append("+ vod start=%s len=%d secs=%d" % (
             start, length, secs))
+    fifo = os.path.join(hlsdir, "in.hevc")
     try:
-        p = subprocess.run(
+        os.remove(fifo)
+    except OSError:
+        pass
+    try:
+        os.mkfifo(fifo)
+    except (OSError, AttributeError) as e:
+        _vod_log("fifo失败（回落纯mp4）：%s" % str(e)[:80])
+        fifo = None
+    ff = None
+    if fifo is not None:
+        try:
+            ff = subprocess.Popen(
+                [FFMPEG, "-hide_banner", "-loglevel", "error",
+                 "-r", "30", "-f", "hevc", "-i", fifo,
+                 "-c", "copy", "-f", "hls", "-hls_time", "2",
+                 "-hls_list_size", "0", "-hls_playlist_type", "event",
+                 "-hls_segment_type", "fmp4",
+                 "-hls_fmp4_init_filename", "init.mp4",
+                 "-hls_segment_filename", "seg%d.m4s", "index.m3u8"],
+                cwd=hlsdir, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
+        except Exception as e:
+            _vod_log("ffmpeg HLS启动失败（回落纯mp4）：%s" % str(e)[:80])
+            ff = None
+    qemu = None
+    fifo_w = None
+    qlog = []
+    try:
+        if ff is not None:
+            fifo_w = open(fifo, "wb")
+        qemu = subprocess.Popen(
             [QEMU, "-L", ROOTFS, sdbin, uid, username, password,
              "1", "1", str(secs), str(start), "--play", str(reqseq)],
             cwd=VODDIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env={**os.environ, "LD_LIBRARY_PATH": BINDIR},
-            timeout=secs + 60)
-        tail = (p.stdout or b"").decode("utf-8", errors="replace")[-300:]
-        with VOD_LOCK:
-            VOD_RUN["log"].append("qemu exit=%s %s" % (p.returncode, tail))
-    except subprocess.TimeoutExpired:
-        with VOD_LOCK:
-            VOD_RUN["log"].append("VOD超时（%ds无退出）" % (secs + 60))
-        return None
+            env={**os.environ, "LD_LIBRARY_PATH": BINDIR})
+
+        def _drain():
+            try:
+                out = qemu.stdout.read() or b""
+                qlog.append(out.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+        threading.Thread(target=_drain, daemon=True).start()
+
+        _vod_forward_frames.__dict__["st"] = {}
+        deadline = time.time() + secs + 60
+        tnv, tbytes, last_ready = 0, 0, False
+        while True:
+            if qemu.poll() is not None:
+                break
+            if fifo_w is not None:
+                nv, nb = _vod_forward_frames(stream, fifo_w)
+                tnv += nv
+                tbytes += nb
+                try:
+                    fifo_w.flush()
+                except Exception:
+                    pass
+                ready = _vod_hls_ready(hlsdir)
+                if ready and not last_ready:
+                    last_ready = True
+                    with VOD_LOCK:
+                        VOD_RUN["hls_ready"] = True
+                    _vod_log("hls playable: %d arrays %dB" % (tnv, tbytes))
+            if time.time() > deadline:
+                _vod_log("VOD超时（%ds无退出），收尾已到帧" % (secs + 60))
+                try:
+                    qemu.terminate()
+                except Exception:
+                    pass
+                break
+            time.sleep(1)
+        try:
+            qemu.wait(timeout=10)
+        except Exception:
+            try:
+                qemu.kill()
+            except Exception:
+                pass
+            try:
+                qemu.wait(timeout=10)
+            except Exception:
+                pass
+        tail = "".join(qlog)[-300:]
+        _vod_log("qemu exit=%s %s" % (qemu.returncode, tail))
+        if fifo_w is not None:
+            nv, nb = _vod_forward_frames(stream, fifo_w)
+            tnv += nv
+            tbytes += nb
+            try:
+                fifo_w.close()
+            except Exception:
+                pass
+            fifo_w = None
+        if ff is not None:
+            try:
+                _, fferr = ff.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                try:
+                    ff.kill()
+                except Exception:
+                    pass
+                _, fferr = ff.communicate()
+            except Exception as e:
+                fferr = str(e).encode("utf-8", errors="replace")
+            if fferr:
+                _vod_log("ffmpeg hls: %s"
+                         % fferr.decode("utf-8",
+                                        errors="replace")[-200:])
+            _vod_log("hls done: segs=%d arrays=%d bytes=%d" % (
+                _vod_hls_segs(hlsdir), tnv, tbytes))
+            with VOD_LOCK:
+                VOD_RUN["hls_ready"] = _vod_hls_ready(hlsdir)
     except Exception as e:
-        with VOD_LOCK:
-            VOD_RUN["log"].append("VOD启动失败：%s" % str(e)[:120])
+        _vod_log("VOD启动失败：%s" % str(e)[:120])
         return None
+    finally:
+        if fifo_w is not None:
+            try:
+                fifo_w.close()
+            except Exception:
+                pass
+        if fifo is not None:
+            try:
+                os.remove(fifo)
+            except OSError:
+                pass
     if not (os.path.isfile(stream) and os.path.getsize(stream) > 0):
         with VOD_LOCK:
             VOD_RUN["log"].append("no stream produced")
@@ -643,9 +1500,13 @@ def run_sd_vod(uid, username, password, start, length, reqseq=3):
     return None
 
 
-def _vod_worker(uid, username, password, start, length, reqseq):
+def _vod_worker(uid, username, password, start, length, reqseq,
+                via_daemon=False):
     try:
-        run_sd_vod(uid, username, password, start, length, reqseq)
+        if via_daemon:
+            run_sd_vod_daemon(uid, start, length, reqseq)
+        else:
+            run_sd_vod(uid, username, password, start, length, reqseq)
     finally:
         with VOD_LOCK:
             VOD_RUN["running"] = False
@@ -716,6 +1577,10 @@ def client_gone(conn):
 def stop_pipeline():
     cap, ff = PIPE["cap"], PIPE["ff"]
     PIPE["cap"], PIPE["ff"] = None, None
+    fhls, whls = PIPE.get("hls"), PIPE.get("hlsfifo")
+    PIPE["hls"], PIPE["hlsfifo"] = None, None
+    hlslog = PIPE.get("hlslog")
+    PIPE["hlslog"] = None
     for p in (ff, cap):
         if p is None:
             continue
@@ -738,8 +1603,134 @@ def stop_pipeline():
                 p.kill()
             except Exception:
                 pass
+    if whls is not None:
+        try:
+            whls.close()
+        except Exception:
+            pass
+    if fhls is not None:
+        try:
+            fhls.wait(timeout=8)
+        except Exception:
+            try:
+                fhls.kill()
+            except Exception:
+                pass
+    if hlslog is not None:
+        try:
+            hlslog.close()
+        except Exception:
+            pass
     with LOCK:
         ST["running"] = False
+
+
+def _live_hls_ready():
+    idx = os.path.join(HLSDIR, "index.m3u8")
+    try:
+        if os.path.getsize(idx) <= 0:
+            return False
+        with open(idx, "rb") as fh:
+            return b".ts" in fh.read()
+    except OSError:
+        return False
+
+
+def _live_hls_segs():
+    try:
+        return len(glob.glob(os.path.join(HLSDIR, "seg*.ts")))
+    except Exception:
+        return 0
+
+
+def live_hls_feeder(rundir, fifo_path):
+    """Feed primed v_*.bin chunks (raw Annex-B) to the HLS ffmpeg fifo.
+
+    The -c copy muxer needs clean codec params at probe time (a decoder
+    would just wait for the next clean IDR, but the muxer gives up), and
+    params only repeat per GOP. So chunks are dropped until the first
+    VPS NAL is seen (buffered across chunk boundaries); everything from
+    there passes through.
+    """
+    dbg = os.path.join(HLSDIR, "feeder.log")
+
+    def _dbg(msg):
+        try:
+            with open(dbg, "ab") as fh:
+                fh.write(("%s %s\n" % (int(time.time()), msg)).encode())
+        except OSError:
+            pass
+
+    _dbg("start")
+    try:
+        # NOTE: buffered "+"/read-write modes demand a seekable stream and
+        # fail on fifos ("not seekable"); unbuffered "wb" blocks till the
+        # ffmpeg reader arrives, same as the VOD path.
+        w = open(fifo_path, "wb", buffering=0)
+    except OSError as e:
+        _dbg("open-fail:%s" % e)
+        return
+    _dbg("fifo-open")
+    PIPE["hlsfifo"] = w
+
+    def _vps_off(b):
+        i = b.find(b"\x00\x00\x00\x01")
+        while i >= 0:
+            if len(b) > i + 4 and ((b[i + 4] >> 1) & 0x3F) == 32:
+                return i
+            i = b.find(b"\x00\x00\x00\x01", i + 1)
+        return -1
+
+    try:
+        n, seeking, pend = 0, True, b""
+        while PIPE.get("hls") is not None:
+            while not PRIME["on"]:
+                time.sleep(0.2)
+                if PIPE.get("hls") is None:
+                    return
+            if n < PRIME["nxt"]:
+                n = PRIME["nxt"]
+            path = os.path.join(rundir, "v_%d.bin" % n)
+            if not os.path.isfile(path):
+                time.sleep(0.15)
+                continue
+            b = stable_read(path)
+            if b is None:
+                time.sleep(0.1)
+                continue
+            if seeking:
+                pend += b
+                if len(pend) > 300000:
+                    pend = pend[-300000:]
+                off = _vps_off(pend)
+                if off < 0:
+                    n += 1
+                    continue
+                b, pend, seeking = pend[off:], b"", False
+                with LOCK:
+                    ST["hls_err"] = "vps@n=%d" % n
+                _dbg("vps@n=%d" % n)
+            try:
+                w.write(b)
+                w.flush()
+            except (BrokenPipeError, ValueError, OSError) as e:
+                with LOCK:
+                    ST["hls_err"] = "write:%s" % str(e)[:60]
+                return
+            with LOCK:
+                ST["hls_n"] += 1
+                ST["hls_bytes"] += len(b)
+            n += 1
+    except Exception as e:
+        with LOCK:
+            ST["hls_err"] = "feeder:%s" % str(e)[:80]
+    finally:
+        try:
+            w.close()
+        except Exception:
+            pass
+        if PIPE.get("hlsfifo") is w:
+            PIPE["hlsfifo"] = None
 
 
 def run_pipeline():
@@ -775,9 +1766,43 @@ def run_pipeline():
         stderr=subprocess.DEVNULL)
     PIPE["cap"], PIPE["ff"] = cap, ff
     threading.Thread(target=split_jpegs, args=(ff,), daemon=True).start()
+    try:
+        os.makedirs(HLSDIR, exist_ok=True)
+        for f in glob.glob(os.path.join(HLSDIR, "*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        fifo = os.path.join(HLSDIR, "in.hevc")
+        try:
+            os.remove(fifo)
+        except OSError:
+            pass
+        os.mkfifo(fifo)
+        hlslog = open(os.path.join(HLSDIR, "ffmpeg-hls.log"), "wb")
+        PIPE["hlslog"] = hlslog
+        fhls = subprocess.Popen(
+            [FFMPEG, "-hide_banner", "-loglevel", "warning",
+             "-r", "30", "-f", "hevc", "-i", fifo,
+             "-c", "copy", "-f", "hls", "-hls_time", "2",
+             "-hls_list_size", "6", "-hls_flags", "delete_segments",
+             "-hls_segment_filename", "seg%d.ts", "index.m3u8"],
+            cwd=HLSDIR, stdout=subprocess.DEVNULL,
+            stderr=hlslog)
+        PIPE["hls"] = fhls
+        PRIME["on"] = False
+        PRIME["nxt"] = 0
+        threading.Thread(target=live_hls_feeder, args=(rundir, fifo),
+                         daemon=True).start()
+    except (OSError, AttributeError) as e:
+        print("live HLS off: %s" % str(e)[:80], flush=True)
+        PIPE["hls"] = None
     with LOCK:
         ST["running"] = True
         ST["spawns"] += 1
+        ST["hls_n"] = 0
+        ST["hls_bytes"] = 0
+        ST["hls_err"] = ""
     print("pipeline spawned", flush=True)
     nxt, primed = 0, False
     try:
@@ -801,6 +1826,8 @@ def run_pipeline():
                     nxt += 1
                     continue
                 primed = True
+                PRIME["on"] = True
+                PRIME["nxt"] = nxt
             try:
                 ff.stdin.write(b)
                 with LOCK:
@@ -854,6 +1881,12 @@ button.on{outline:2px solid #2a6}
 .ev .meta{color:#999;font-size:11px;margin:2px 0}
 .ev a{color:#1a5fb4;text-decoration:none;margin-right:8px}
 .ev a:hover{text-decoration:underline}
+.switch{position:relative;display:inline-block;width:44px;height:24px;vertical-align:middle}
+.switch input{opacity:0;width:0;height:0}
+.switch .sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#bbb;border-radius:24px;transition:.2s}
+.switch .sl:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+.switch input:checked + .sl{background:#2a6}
+.switch input:checked + .sl:before{transform:translateX(20px)}
 .err{color:#c00}.ok{color:#1a7f1a}.muted{color:#888}.warn{color:#d60}
 .logout{background:#111;color:#9d9;font-size:12px;font-family:monospace;border-radius:4px;padding:8px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 .navtabs{display:flex;gap:0;background:#fff;border:1px solid #ddd;border-radius:8px;overflow:hidden;margin-bottom:12px}
@@ -875,9 +1908,9 @@ button.on{outline:2px solid #2a6}
 .dev-row{display:flex;gap:12px;align-items:stretch}
 .dev-left{flex:1;min-width:0;display:flex;flex-direction:column}
 .dev-left #dev-cards{margin-top:10px}
-#side-player{flex:1;min-width:0;margin-bottom:0;display:flex;flex-direction:column}
-#side-player video{width:100%;flex:1;min-height:0;object-fit:contain;background:#000;border-radius:4px}
-@media (max-width:900px){.dev-row{flex-direction:column}#side-player{width:100%;flex:auto}}
+#side-player,#live-player,#relay-player,#lan-sd-player{flex:1;min-width:0;margin-bottom:0;display:flex;flex-direction:column}
+#side-player video,#live-player img,#relay-player img,#lan-sd-player video{width:100%;flex:1;min-height:0;object-fit:contain;background:#000;border-radius:4px}
+@media (max-width:900px){.dev-row{flex-direction:column}#side-player,#live-player,#relay-player,#lan-sd-player{width:100%;flex:auto}}
 </style>
 </head>
 <body>
@@ -926,57 +1959,43 @@ button.on{outline:2px solid #2a6}
 </div><!-- /tab-dev -->
 
 <div class="tabpage" id="tab-live">
-<div class="card">
 <div class="dev-row">
-<div class="dev-left" style="flex:3">
-<b>直播</b>
-<div style="margin:8px 0"><button onclick="startLan(1)" style="width:100%">内网直播主</button></div>
-<div style="margin:8px 0"><button onclick="startLan(0)" style="width:100%">内网直播辅</button></div>
-<div style="margin:8px 0"><button onclick="stopLan()" class="danger" style="width:100%">停止</button></div>
-<div id="live-msg" class="muted">idle</div>
-<div id="live-stats" class="muted">idle</div>
-<pre id="live-log" class="logout">等待启动…</pre>
-<div class="muted" style="margin-top:4px">主=1080p / 辅=360p，设备凭证自动取云端，强制局域网直连。切走本页即停看（60秒后管线停）。</div>
-<div class="card" style="margin-top:12px;border-color:#2a6">
-<b>SD卡录像（局域网直连）</b>
-<div style="margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-<label>近 <select id="lan-sd-hours"><option value="6">6小时</option><option value="24" selected>24小时</option><option value="72">3天</option><option value="168">7天</option></select></label>
-<label>等待 <select id="lan-sd-secs"><option value="20">20秒</option><option value="40" selected>40秒</option><option value="60">60秒</option><option value="90">90秒</option></select></label>
-<button onclick="sdLanList()" style="white-space:nowrap">查询SD列表</button>
-<span id="lan-sd-status" class="muted">与直播同走局域网直连P2P（0x101），有回包即提前返回（一般20~40秒），点播前请先确认直播能出画面</span>
+<div class="dev-left">
+<div class="card">
+<b>信息</b>
+<div id="live-info" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin-top:10px"></div>
 </div>
-<pre id="lan-sd-log" class="logout">SD就绪（P2P直连查0x101，有回包即提前返回）</pre>
-<div id="lan-sd-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:8px"></div>
-<video id="lan-sd-vid" controls playsinline style="width:100%;margin-top:8px;background:#000;border-radius:4px;display:none"></video>
-<div id="lan-sd-playinfo" class="muted" style="margin-top:4px"></div>
-<div class="muted" style="margin-top:4px">SD列表/回放走P2P直连设备（非云端）；等待时长可调，有回包即提前返回（一般20~40秒）。同一时间只查一个。</div>
+<div class="card">
+<h2 style="margin-top:0">功能</h2>
+<div id="live-funcs" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px"></div>
 </div>
 </div>
-<div style="flex:7;min-width:0">
-<img id="live-img" alt="live" style="width:100%;display:block;background:#000;border-radius:4px">
+<div class="card" id="live-player">
+<b>画面</b>
+<img id="live-img" alt="live" style="margin-top:6px">
 </div>
 </div>
-</div>
+<div id="live-func-inline" style="margin-top:12px"></div>
 </div><!-- /tab-live -->
 
 <div class="tabpage" id="tab-relaylive">
-<div class="card">
 <div class="dev-row">
-<div class="dev-left" style="flex:3">
-<b>中继直播</b>
-<div style="margin:8px 0"><button onclick="startRelay(1)" style="width:100%">中继直播主</button></div>
-<div style="margin:8px 0"><button onclick="startRelay(0)" style="width:100%">中继直播辅</button></div>
-<div style="margin:8px 0"><button onclick="stopRelay()" class="danger" style="width:100%">停止</button></div>
-<div id="relay-msg" class="muted">idle</div>
-<div id="relay-stats" class="muted">idle</div>
-<pre id="relay-log" class="logout">等待启动…</pre>
-<div class="muted" style="margin-top:4px">主=1080p / 辅=360p，设备凭证自动取云端，强制走公网中继（封局域网发现），异地/跨网段用它。切走本页即停看。</div>
+<div class="dev-left">
+<div class="card">
+<b>信息</b>
+<div id="relay-info" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin-top:10px"></div>
 </div>
-<div style="flex:7;min-width:0">
-<img id="relay-img" alt="live" style="width:100%;display:block;background:#000;border-radius:4px">
+<div class="card">
+<h2 style="margin-top:0">功能</h2>
+<div id="relay-funcs" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px"></div>
 </div>
 </div>
+<div class="card" id="relay-player">
+<b>画面</b>
+<img id="relay-img" alt="live" style="margin-top:6px">
 </div>
+</div>
+<div id="relay-func-inline" style="margin-top:12px"></div>
 </div><!-- /tab-relaylive -->
 
 <div class="tabpage" id="tab-user">
@@ -994,12 +2013,22 @@ button.on{outline:2px solid #2a6}
   <b>会话</b>
   <div id="user-session" class="muted" style="margin-top:6px">待加载</div>
 </div>
+<div class="card">
+  <b>设备参数</b>
+  <div class="muted" style="margin-top:4px">登录后一次拉取，多处共用不重查 <span id="user-params-ts"></span></div>
+  <div id="user-params" style="margin-top:6px">待加载</div>
+  <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input id="u-dpass" type="text" placeholder="改设备密码（明文）" style="flex:1;min-width:160px">
+    <button onclick="saveUserPass()" style="white-space:nowrap;margin:0">保存密码</button>
+    <span id="user-pass-msg" class="muted"></span>
+  </div>
+</div>
 </div><!-- /tab-user -->
 
 <div class="tabpage" id="tab-doc">
 <h2 style="margin-top:0">接口</h2>
 <div class="card">
-   <div>本机接口：/api/login /api/logout /api/session /api/devices（含sd透传） /api/device /api/device-login /api/device/webrtc_token /api/cloud/list /api/cloud/url /api/sd/list（P2P直连0x101查SD，secs最多等待15~90s、有回包提前返回） /api/sd/list_live（查询中途看已到条目，动态显示用） /api/sd/vod /api/sd/vod_status /api/sd/vod_file（AVCMD command=9点播转mp4） /api/settings /api/transport /stats /snap.jpg /video.mjpg</div>
+   <div>本机接口：/api/login /api/logout /api/session /api/devices（含sd透传） /api/device /api/device-login /api/device/webrtc_token /api/cloud/list /api/cloud/url /api/sd/list（P2P直连0x101查SD，secs最多等待15~90s、有回包提前返回） /api/sd/list_live（查询中途看已到条目，动态显示用） /api/sess/connect /api/sess/disconnect /api/sess/status（手动建联开关+状态，SD列表优先走会话） /api/sd/vod /api/sd/vod_status /api/sd/vod_file（AVCMD command=9点播转mp4） /api/settings /api/transport /stats /snap.jpg /video.mjpg /api/live/hls（直播HLS分片）</div>
   <div class="muted" style="margin-top:6px">设备密码与云密码只进容器 /data，不进配置不进仓库。直播推流暂未接入，页面先行。</div>
 </div>
 </div><!-- /tab-doc -->
@@ -1013,9 +2042,111 @@ function show(id,msg,ok){document.getElementById(id).innerHTML='<span class="'+(
 function fmsg(msg,ok){var el=document.getElementById('dev-msg2');show(el?'dev-msg2':'dev-msg',msg,ok);var rm=document.getElementById('relay-msg');if(rm)rm.innerHTML='<span class="'+(ok?'ok':'muted')+'">'+msg+'</span>';var lm=document.getElementById('live-msg');if(lm)lm.innerHTML='<span class="'+(ok?'ok':'muted')+'">'+msg+'</span>';}
 
 var _devs=[];
+var _DEV={byUid:{},ts:0,count:0};
+var _sessionSnap=null;
+// 常量/变量规则：
+// - 常量（一台设备终身不变）：devC(uid) 直接给缓存引用，零拷贝，禁止写入。
+// - 变量（会变：在线/电量/信号/录像条数等）：必须 getDev(uid)/curParams() 拿拷贝，
+//   禁止拿缓存引用（谁改一下全脏，且读到过期值）。只有 storeDevs 能写缓存。
+var DEVC_CONST=['uid','model','firmware','device_type','product_id',
+  'bind_utc','device_user','esim_eid'];
+function storeDevs(d){
+  _devs=(d&&d.items)||[];
+  _DEV.byUid={};
+  _devs.forEach(function(i){if(i&&i.uid)_DEV.byUid[i.uid]=i;});
+  _DEV.ts=Date.now();
+  _DEV.count=_devs.length;
+}
+function devC(uid){return (uid&&_DEV.byUid[uid])||null;}
+function getDev(uid){
+  var s=devC(uid);
+  if(!s)return null;
+  var c={};
+  for(var k in s){
+    if(!s.hasOwnProperty(k))continue;
+    var v=s[k];
+    if(DEVC_CONST.indexOf(k)>=0){c[k]=v;continue;}
+    if(v&&typeof v==='object'){c[k]=JSON.parse(JSON.stringify(v));}
+    else{c[k]=v;}
+  }
+  return c;
+}
+function curParams(){return getDev(curUid());}
+function devVal(uid,key,fb){var i=getDev(uid);return (i&&(i[key]!==undefined&&i[key]!==null))?i[key]:(fb===undefined?'—':fb);}
 function fmtTime(utc){
   if(!utc)return '—';
   try{return new Date(utc*1000).toLocaleString('zh-CN');}catch(e){return String(utc);}
+}
+function fmtVal(k,v){
+  if(v===null||v===undefined||v==='')return '—';
+  if(k==='online')return v?'在线':'离线';
+  if(typeof v==='boolean')return v?'是':'否';
+  if(k==='battery')return v+'%';
+  if(/_utc$/.test(k))return fmtTime(v);
+  if(k==='time_diff')return tzLabel(v);
+  if(k==='cur_work_mode'||k==='want_work_mode')return modeLabel(v);
+  if(k==='ext_notice'){
+    if(!v.length)return '无';
+    return v.map(function(e){return e[0]+(e[1]?'开':'关');}).join('、');
+  }
+  if(k==='sd'){
+    var ks=Object.keys(v);
+    if(!ks.length)return '无字段';
+    return ks.map(function(x){return x+'='+v[x];}).join('；');
+  }
+  if(typeof v==='object')return JSON.stringify(v).slice(0,120);
+  return String(v);
+}
+var PARAM_GROUPS=[
+ {t:'基本信息',rows:[['名称','name'],['UID','uid'],['型号','model'],['固件','firmware'],['在线','online'],['在线态','online_state'],['绑定','bind_utc']]},
+ {t:'电源状态',rows:[['电量','battery'],['充电中','charging'],['信号','signal'],['低电量','low_power'],['最后活跃','last_active_utc']]},
+ {t:'归属网络',rows:[['本人设备','is_owner'],['区服','ps_name'],['zone','zone_id'],['地址','address_id'],['时区','time_diff'],['位置','location'],['AP直连','is_ap_device'],['夏令时','is_dst']]},
+ {t:'云存储',rows:[['已开通','has_cloud_storage'],['已开启','cloud_opened'],['功能码','dev_func']]},
+ {t:'工作模式',rows:[['当前','cur_work_mode'],['期望','want_work_mode'],['全景','is_panoramic']]},
+ {t:'通知',rows:[['推送','notice_on'],['通知开关','notice_enabled'],['扩展通知','ext_notice']]},
+ {t:'套餐与卡',rows:[['可插卡','can_insert_sim'],['套餐状态','card_pkg_flow'],['套餐到期','card_pkg_expire'],['终身套餐','is_lifetime_plan'],['Ubia卡','is_ubia_card'],['锁定','is_lock'],['有ICCID','has_icc'],['eSIM EID','esim_eid'],['在用eSIM','using_esim'],['Ubia eSIM','is_ubia_esim'],['流量同步建议','suggest_sync_traffic'],['套餐绑用户','pkg_bound_on_user']]},
+ {t:'设备与杂项',rows:[['设备账号','device_user'],['设备密码','device_pwd'],['密码已配','has_pwd'],['Alexa','alexa_status'],['AlexaID','alexa_id'],['权限','permissions'],['产品线','product_id'],['设备类型','device_type'],['SD卡','sd'],['局域网IP','lan_ip'],['局域网端口','lan_port'],['会话sid','sid'],['会话random','sess_random'],['会话nonce','sess_nonce'],['会话结果','sess_result']]},
+];
+function paramTable(title,rows,get){
+  var h='<div style="margin-top:8px"><b>'+title+'</b><table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:4px">';
+  rows.forEach(function(r){
+    h+='<tr><td class="muted" style="border-top:1px solid #eee;padding:3px 6px;width:110px">'+r[0]+'</td><td style="border-top:1px solid #eee;padding:3px 6px;word-break:break-all">'+escHtml(fmtVal(r[1],get(r[1])))+'</td></tr>';
+  });
+  return h+'</table></div>';
+}
+function renderUserParams(){
+  var box=document.getElementById('user-params');
+  if(!box)return;
+  var i=curParams();
+  var ts=document.getElementById('user-params-ts');
+  if(!i){box.innerHTML='<span class="muted">待加载（登录后自动拉取）</span>';if(ts)ts.textContent='';return;}
+  if(ts&&_DEV.ts)ts.textContent='· 取于 '+new Date(_DEV.ts).toLocaleTimeString('zh-CN',{hour12:false});
+  var s=_sessionSnap||{};
+  var h='<div class="muted" style="margin:6px 0">当前设备：'+escHtml(i.name||i.uid||'')+'</div>';
+  h+=paramTable('会话',[
+    ['账号','account'],['区服','region'],['已登录','logged_in'],['自动续登','auto']
+  ],function(k){return s[k];});
+  PARAM_GROUPS.forEach(function(g){    h+=paramTable(g.t,g.rows,function(k){return i[k];});
+  });
+  box.innerHTML=h;
+  try{
+    var inp=document.getElementById('u-dpass');
+    if(inp&&!inp.value&&i.device_pwd)inp.value=i.device_pwd;
+  }catch(e){}
+}
+function saveUserPass(){
+  var msg=document.getElementById('user-pass-msg');
+  var uid=curUid();
+  var u=(getDev(uid)||{}).device_user||'admin';
+  var inp=document.getElementById('u-dpass');
+  var p=(inp&&inp.value)||'';
+  if(!uid||!p){if(msg)msg.textContent='请先选设备并输入密码';return;}
+  if(msg)msg.textContent='保存中…';
+  post('/api/device-login',{uid:uid,username:u,password:p}).then(function(r){
+    if(r.error){if(msg)msg.textContent=r.error;return;}
+    if(msg)msg.textContent=r.cached?'与缓存一致，未改动':'已保存（取流已重启）';
+    loadDevices();
+  }).catch(function(e){if(msg)msg.textContent='保存失败：'+e;});
 }
 function devLabel(i){
   var parts=[i.name||'?'];
@@ -1035,7 +2166,7 @@ function loadDevices(quiet){
     var sel=document.getElementById('dev-list');
     var keep=curUid();
     sel.innerHTML='';
-    _devs=d.items||[];
+    storeDevs(d);
     if(!_devs.length){sel.innerHTML='<option value="">— 无设备 —</option>';renderDevDetail();return;}
     _devs.forEach(function(i){
       var o=document.createElement('option');
@@ -1049,12 +2180,12 @@ function loadDevices(quiet){
     renderDevTabs();
     renderDevDetail();
     renderFuncGrid();
+    renderUserParams();
+    loadUserStats();
   }).catch(function(e){if(!quiet)show('dev-msg','请求失败：'+e);});
 }
 function curDev(){
-  var uid=curUid();
-  for(var k=0;k<_devs.length;k++)if(_devs[k].uid===uid)return _devs[k];
-  return null;
+  return getDev(curUid());
 }
 function renderDevDetail(){
   var i=curDev();
@@ -1071,7 +2202,9 @@ function renderDevDetail(){
     ' · 云存储 '+(i.has_cloud_storage?'已开通':'未开通')+'/'+(i.cloud_opened?'已开启':'未开启')+
     '<br><span class="muted">'+i.uid+'</span>';
   renderDevCards();
-  try{if(document.getElementById('sd-card'))renderSdCard();}catch(e){}
+  try{renderLiveInfo();}catch(e){}
+  try{renderRelayInfo();}catch(e){}
+  try{renderUserParams();}catch(e){}
 }
 function escHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function yn(v){return v?'是':'否';}
@@ -1154,27 +2287,6 @@ function renderCloudCard(){
     if(el)el.innerHTML='<div class="nm">云录像</div><div class="st err">加载失败</div>';
   });
 }
-function renderSdCard(){
-  var box=document.getElementById('sd-card');
-  var dev=curDev();
-  if(!box)return;
-  if(!dev){box.innerHTML='<div class="nm">SD卡录像</div><div class="st muted">无设备</div>';return;}
-  var sd=dev.sd||{};
-  var keys=Object.keys(sd);
-  if(!keys.length){box.innerHTML='<div class="nm">SD卡录像</div><div class="st muted">云端未返回SD字段</div>';return;}
-  var pick=function(){
-    for(var i=0;i<arguments.length;i++){var v=sd[arguments[i]];if(v!==undefined&&v!==null&&v!=='')return v;}
-    return null;
-  };
-  var st=pick('sd_status','sd_state','sdcard_status','sd_card_status','tf_status','sdcard_state');
-  var cap=pick('sd_capacity','sd_total','sd_size','storage_total','total_size');
-  var free=pick('sd_free','sd_available','storage_free','free_size');
-  var mode=pick('record_mode','record_status','sd_record_mode','sd_mode');
-  var line=(st!==null?('状态 '+st):'SD字段 '+keys.length+' 项')+
-    (cap!==null?(' · 总 '+cap):'')+(free!==null?(' · 剩 '+free):'')+(mode!==null?(' · '+mode):'');
-  box.innerHTML='<div class="nm">SD卡录像</div><div class="st">'+escHtml(line)+'</div>'+
-    '<div class="st muted">点开看全部SD字段</div>';
-}
 function queryEvents(){
   var uid=curUid();
   if(!uid){fmsg('请先选择设备');return;}
@@ -1234,6 +2346,7 @@ function playSide(url,info){
   var v=document.getElementById('side-vid');
   var box=document.getElementById('side-player');
   if(!v||!box)return;
+  sdHlsDestroy(v);
   try{v.pause();}catch(e){}
   v.src=url;
   try{v.load();var _pr=v.play();if(_pr&&_pr.catch)_pr.catch(function(){});}catch(e){}
@@ -1283,9 +2396,6 @@ function renderFuncGrid(){
     box.innerHTML+='<div class="dev-card" id="cloud-card" onclick="openFunc(\'events\')">'+
       '<div class="nm">云录像</div><div class="st muted">加载中…</div></div>';
     renderCloudCard();
-    box.innerHTML+='<div class="dev-card" id="sd-card" onclick="openFunc(\'sd\')">'+
-      '<div class="nm">SD卡录像</div><div class="st muted">加载中…</div></div>';
-    renderSdCard();
   }
 }
 var _openFunc=null;
@@ -1335,20 +2445,6 @@ function buildFuncPage(id){
       '<span id="list-msg" class="muted"></span></div>'+
       '<div id="grid" style="margin-top:8px"></div></div>';
     queryEvents();
-    return;
-  }
-  if(id==='sd'){
-    document.getElementById('func-inline').innerHTML=
-      '<div class="card" style="border-color:#2a6"><div class="nm">SD卡录像 <span class="muted">'+escHtml((curDev()||{}).name||'')+'</span></div>'+
-      '<div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">'+
-      '<label>近 <select id="sd-hours"><option value="6">6小时</option><option value="24" selected>24小时</option><option value="72">3天</option><option value="168">7天</option></select></label>'+
-      '<label>等待 <select id="sd-secs"><option value="20">20秒</option><option value="40" selected>40秒</option><option value="60">60秒</option><option value="90">90秒</option></select></label>'+
-      '<button onclick="sdList()" style="white-space:nowrap">查询SD列表</button>'+
-      '<span id="sd-status" class="muted">P2P直连查0x101，有回包即提前返回（一般20~40秒）；点条目即播右侧播放器</span></div>'+
-      '<div id="sd-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:8px"></div>'+
-      '<div class="muted" style="margin-top:4px">点播走AVCMD command=9（约1~4分钟转mp4），同一时间只跑一个点播。</div>'+
-      '<span id="dev-msg2" class="muted"></span></div>';
-    sdList();
     return;
   }
   if(id==='snap'){
@@ -1413,23 +2509,31 @@ function startStream(kind,n){
   var tab=isDirect?'live':'relaylive';
   var imgId=isDirect?'live-img':'relay-img';
   var modeName=isDirect?'直连':'中继';
-  fmsg('取云端设备凭证…');
-  llog(kind,'取云端设备凭证…');
-  get('/api/devices').then(function(d){
+  fmsg('取设备凭证（缓存优先）…');
+  llog(kind,'取设备凭证（缓存优先）…');
+  get('/api/device').then(function(dev){
+    if(dev&&dev.uid&&dev.uid===curUid()&&dev.has_password){
+      fmsg('用已缓存设备直接取流…');
+      llog(kind,'设备缓存命中，跳过云端重查');
+      return {cached:true};
+    }
+    fmsg('取云端设备凭证…');
+    llog(kind,'取云端设备凭证…');
+    return get('/api/devices').then(function(d){
     if(d.error){fmsg(d.error);llog(kind,'devices失败: '+d.error);return null;}
-    var items=d.items||[];
-    var it=null;
-    for(var k=0;k<items.length;k++){if(items[k].uid===curUid()){it=items[k];break;}}
-    if(!it)it=items[0];
+    storeDevs(d);
+    renderUserParams();
+    var it=getDev(curUid())||getDev((_devs[0]||{}).uid);
     if(!it){fmsg('无设备');llog(kind,'无设备');return null;}
     if(!it.device_pwd){fmsg('该设备云端无密码');llog(kind,'云端无密码');return null;}
     fmsg('用 '+(it.name||it.uid)+' 取流…');
     llog(kind,'用 '+(it.name||it.uid)+' 登录，码流'+n);
     return post('/api/device-login',{uid:it.uid,username:it.device_user||'admin',password:it.device_pwd});
+    });
   }).then(function(r){
     if(!r)return;
     if(r.error){fmsg(r.error);llog(kind,'device-login失败: '+r.error);return null;}
-    llog(kind,'device-login ok');
+    llog(kind,r.cached?'设备缓存直用（未重启管线）':'device-login ok');
     return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stream:n})});
   }).then(function(r){
     if(!r)return null;
@@ -1460,7 +2564,14 @@ function stopStream(kind){
   var g=document.getElementById('relay-img');
   if(g)g.src='about:blank';
   var s=document.getElementById('side-vid');
+  sdHlsDestroy(s);
   if(s)s.src='about:blank';
+  var lv=document.getElementById('lan-sd-vid');
+  sdHlsDestroy(lv);
+  if(lv){try{lv.pause();}catch(e){}lv.removeAttribute('src');try{lv.load();}catch(e){}}
+  var lhv=document.getElementById('live-hls-vid');
+  sdHlsDestroy(lhv);
+  stopLiveHlsPoll();
   fmsg('已停止（管线已掐断）');
 }
 function snapNow(){
@@ -1468,8 +2579,239 @@ function snapNow(){
   if(v)v.innerHTML='<img src="/snap.jpg?ts='+Date.now()+'" style="width:100%;max-width:480px;display:block;border-radius:4px" onerror="fmsg(\'暂无帧（取流未起）\')">';
   fmsg('已抓拍',true);
 }
-function sdLanLog(msg){
-  var el=document.getElementById('lan-sd-log');
+function sessToggle(el){
+  if(el&&el.checked){sessConnect();}
+  else{sessDisconnect();}
+}
+function sessConnect(){
+  var uid=curUid();
+  var st=document.getElementById('sess-status');
+  if(!uid){if(st)st.textContent='请先选择设备';return;}
+  if(st)st.textContent='建联中…';
+  sdLanLog('建联 uid='+uid);
+  post('/api/sess/connect',{uid:uid}).then(function(r){
+    if(!r.ok){if(st)st.textContent='建联失败: '+(r.error||'?');sdLanLog('建联失败: '+(r.error||'?'));return;}
+    if(st)st.textContent='已建联 '+uid;
+    sdLanLog('建联成功');
+    sessRefresh();
+  }).catch(function(e){if(st)st.textContent='建联请求失败：'+e;});
+}
+function sessDisconnect(){
+  var st=document.getElementById('sess-status');
+  post('/api/sess/disconnect',{}).then(function(){
+    if(st)st.textContent='未建联';
+    sdLanLog('已断开');
+    sessRefresh();
+  }).catch(function(){});
+}
+function sessRefresh(){
+  get('/api/sess/status').then(function(s){
+    var el=document.getElementById('sess-status');
+    if(!el||!s)return;
+    el.textContent=sessText(s);
+  }).catch(function(){});
+}
+function sessText(s){
+  if(!s||!s.up)return '未建联'+((s&&s.note)?'（'+s.note+'）':'');
+  return '已建联 '+(s.uid||'')+' · '+s.uptime_s+'s · 闲置'+s.idle_left_s+'s后断'+(s.note?' · '+s.note:'');
+}
+var _sessSnap=null;
+var _statsSnap=null;
+var LIVE_FUNCS=[
+ {id:'live',name:'内网直播',desc:'主/辅/停止，画面进右侧'},
+ {id:'hls',name:'HLS播放',desc:'m3u8分片，浏览器播'},
+ {id:'sess',name:'会话建联',desc:'手动建联/断开，SD直发包'},
+ {id:'sd',name:'SD卡录像',desc:'查列表点播，画面进下方'},
+];
+var RELAY_FUNCS=[
+ {id:'relay',name:'中继直播',desc:'主/辅/停止，画面进右侧'},
+];
+function renderLiveFuncs(){
+  var box=document.getElementById('live-funcs');
+  if(!box)return;
+  var h='';
+  LIVE_FUNCS.forEach(function(f){
+    h+='<div class="dev-card" onclick="openLiveFunc(\''+f.id+'\')">';
+    h+='<div class="nm">'+f.name+'</div>';
+    h+='<div class="st">'+f.desc+'</div></div>';
+  });
+  box.innerHTML=h;
+}
+function renderRelayFuncs(){
+  var box=document.getElementById('relay-funcs');
+  if(!box)return;
+  var h='';
+  RELAY_FUNCS.forEach(function(f){
+    h+='<div class="dev-card" onclick="openRelayFunc(\''+f.id+'\')">';
+    h+='<div class="nm">'+f.name+'</div>';
+    h+='<div class="st">'+f.desc+'</div></div>';
+  });
+  box.innerHTML=h;
+}
+var _liveFunc=null;
+var _liveHlsTimer=null;
+function startLiveHlsPoll(){
+  stopLiveHlsPoll();
+  liveHlsPoll();
+  _liveHlsTimer=setInterval(liveHlsPoll,2000);
+}
+function stopLiveHlsPoll(){
+  if(_liveHlsTimer){clearInterval(_liveHlsTimer);_liveHlsTimer=null;}
+  var v=document.getElementById('live-hls-vid');
+  sdHlsDestroy(v);
+}
+function liveHlsPoll(){
+  var v=document.getElementById('live-hls-vid');
+  if(!v){stopLiveHlsPoll();return;}
+  var info=document.getElementById('live-hls-info');
+  fetch('/stats').then(function(r){return r.json();}).then(function(s){
+    var lh=s.live_hls||{};
+    if(lh.ready&&v._hlsFor!=='live'){
+      if(info)info.textContent='实时播放中（HLS）';
+      sdHlsAttach(v,'/api/live/hls?file=index.m3u8','live','livehls');
+    }else if(!v._hlsFor){
+      if(info)info.textContent=s.running?('切片中…（分片'+(lh.segs||0)+'）'):'等待管线…（先播内网直播）';
+    }
+  }).catch(function(){});
+}
+function openLiveFunc(id){
+  if(_liveFunc===id){
+    document.getElementById('live-func-inline').innerHTML='';
+    _liveFunc=null;
+    stopLiveHlsPoll();
+    return;
+  }
+  _liveFunc=id;
+  stopLiveHlsPoll();
+  buildLiveFunc(id);
+  var el=document.getElementById('live-func-inline');
+  if(el)el.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+var _relayFunc=null;
+function openRelayFunc(id){
+  if(_relayFunc===id){
+    document.getElementById('relay-func-inline').innerHTML='';
+    _relayFunc=null;
+    return;
+  }
+  _relayFunc=id;
+  buildRelayFunc(id);
+  var el=document.getElementById('relay-func-inline');
+  if(el)el.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function buildLiveFunc(id){
+  var box=document.getElementById('live-func-inline');
+  if(!box)return;
+  if(id==='live'){
+    box.innerHTML='<div class="card"><b>内网直播</b>'+
+      '<div style="margin:8px 0"><button onclick="startLan(1)" style="width:100%">内网直播主</button></div>'+
+      '<div style="margin:8px 0"><button onclick="startLan(0)" style="width:100%">内网直播辅</button></div>'+
+      '<div style="margin:8px 0"><button onclick="stopLan()" class="danger" style="width:100%">停止</button></div>'+
+      '<div id="live-msg" class="muted">idle</div>'+
+      '<div id="live-stats" class="muted">idle</div>'+
+      '<pre id="live-log" class="logout">等待启动…</pre>'+
+      '<div class="muted" style="margin-top:4px">主=1080p / 辅=360p，设备凭证自动取云端，强制局域网直连。切走本页即停看（60秒后管线停）。</div></div>';
+    return;
+  }
+  if(id==='sess'){
+    box.innerHTML='<div class="card" style="border-color:#2a6"><b>会话（手动建联）</b>'+
+      '<div style="margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+      '<button onclick="sessConnect()" style="white-space:nowrap">建联</button>'+
+      '<button onclick="sessDisconnect()" class="danger" style="white-space:nowrap">断开</button>'+
+      '<span id="sess-status" class="muted">未建联</span></div>'+
+      '<div class="muted" style="margin-top:4px">建联后SD列表走会话直发包（秒回）；未建联自动单次建联查询。闲置5分钟自动断开省电（太阳能设备）。</div></div>';
+    sessRefresh();
+    return;
+  }
+  if(id==='hls'){
+    box.innerHTML='<div class="card" style="border-color:#2a6"><b>HLS播放（内网直播）</b>'+
+      '<video id="live-hls-vid" controls playsinline style="width:100%;margin-top:6px;background:#000;border-radius:4px"></video>'+
+      '<div style="margin-top:6px"><span id="live-hls-info" class="muted">等待管线…（先播内网直播）</span></div>'+
+      '<div class="muted" style="margin-top:4px">同一直播流的m3u8分片版，延迟比MJPEG大几秒；管线停后画面定格。</div></div>';
+    startLiveHlsPoll();
+    return;
+  }
+  if(id==='sd'){
+    box.innerHTML='<div class="dev-row"><div class="dev-left">'+
+      '<div class="card" style="border-color:#2a6"><b>SD卡录像（局域网直连）</b>'+
+      '<div style="margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+      '<label>近 <select id="lan-sd-hours"><option value="6">6小时</option><option value="24" selected>24小时</option><option value="72">3天</option><option value="168">7天</option></select></label>'+
+      '<label>等待 <select id="lan-sd-secs"><option value="20">20秒</option><option value="40" selected>40秒</option><option value="60">60秒</option><option value="90">90秒</option></select></label>'+
+      '<button onclick="sdLanList()" style="white-space:nowrap">查询SD列表</button>'+
+      '<span id="lan-sd-status" class="muted">已建联走会话直发包（秒回），未建联自动单次建联查询</span></div>'+
+      '<pre id="lan-sd-log" class="logout">SD就绪（P2P直连查0x101，有回包即提前返回）</pre>'+
+      '<div id="lan-sd-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:8px"></div></div>'+
+      '</div>'+
+      '<div class="card" id="lan-sd-player"><b>回放</b>'+
+      '<video id="lan-sd-vid" controls playsinline style="margin-top:6px;display:none"></video>'+
+      '<div style="margin-top:6px"><span id="lan-sd-playinfo" class="muted">未在播</span></div>'+
+      '</div></div>'+
+      '<div class="muted" style="margin-top:4px">SD列表/回放走P2P直连设备（非云端）；等待时长可调。同一时间只查一个。</div>';
+    return;
+  }
+}
+function buildRelayFunc(id){
+  var box=document.getElementById('relay-func-inline');
+  if(!box)return;
+  if(id==='relay'){
+    box.innerHTML='<div class="card"><b>中继直播</b>'+
+      '<div style="margin:8px 0"><button onclick="startRelay(1)" style="width:100%">中继直播主</button></div>'+
+      '<div style="margin:8px 0"><button onclick="startRelay(0)" style="width:100%">中继直播辅</button></div>'+
+      '<div style="margin:8px 0"><button onclick="stopRelay()" class="danger" style="width:100%">停止</button></div>'+
+      '<div id="relay-msg" class="muted">idle</div>'+
+      '<div id="relay-stats" class="muted">idle</div>'+
+      '<pre id="relay-log" class="logout">等待启动…</pre>'+
+      '<div class="muted" style="margin-top:4px">主=1080p / 辅=360p，设备凭证自动取云端，强制走公网中继（封局域网发现），异地/跨网段用它。切走本页即停看。</div></div>';
+    return;
+  }
+}
+function renderLiveInfo(){
+  var box=document.getElementById('live-info');
+  if(!box)return;
+  var i=curDev();
+  var h='';
+  if(i){
+    h+='<div class="dev-card"><div class="nm">'+escHtml(i.name||'?')+' '+(i.online?'<span class="ok">●在线</span>':'<span class="err">○离线</span>')+'</div>';
+    h+='<div class="st">电量 '+(i.battery!=null?i.battery+'%':'—')+' · 信号 '+(i.signal!=null?i.signal:'—')+' · 活跃 '+fmtTime(i.last_active_utc)+'</div>';
+    h+='<div class="st">型号 '+escHtml(i.model||'—')+' · 固件 '+escHtml(i.firmware||'—')+'</div>';
+    h+='<div class="st muted">'+escHtml(i.uid||'')+'</div></div>';
+  }else{
+    h+='<div class="dev-card"><div class="nm">设备</div><div class="st muted">无设备（先去设备页登录）</div></div>';
+  }
+  var s=_sessSnap||{};
+  var hs=s.hs||{};
+  if(s.up){
+    h+='<div class="dev-card"><div class="nm">会话 <span class="ok">●已建联</span> '+
+      '<label class="switch" style="float:right"><input type="checkbox" checked onchange="sessToggle(this)"><span class="sl"></span></label></div>';
+    h+='<div class="st">sid '+escHtml(hs.hs_sid||'—')+' · randomID '+escHtml(hs.hs_random||'—')+'</div>';
+    h+='<div class="st">就绪经 '+escHtml(hs.hs_ready_via||'—')+' · 在线 '+s.uptime_s+'s</div>';
+    h+='<div class="st">传输 '+(s.sess_tr||'—')+' · 闲置'+s.idle_left_s+'s后断'+(s.note?' · '+escHtml(s.note):'')+'</div></div>';
+  }else{
+    h+='<div class="dev-card"><div class="nm">会话 <span class="err">○未建联</span> '+
+      '<label class="switch" style="float:right"><input type="checkbox" onchange="sessToggle(this)"><span class="sl"></span></label></div>'+
+      '<div class="st muted">右滑开关建联'+(s.note?'（'+escHtml(s.note)+'）':'')+'</div></div>';
+  }
+  box.innerHTML=h;
+}
+function renderRelayInfo(){
+  var box=document.getElementById('relay-info');
+  if(!box)return;
+  var i=curDev();
+  var s=_statsSnap||{};
+  var h='';
+  if(i){
+    h+='<div class="dev-card"><div class="nm">'+escHtml(i.name||'?')+' '+(i.online?'<span class="ok">●在线</span>':'<span class="err">○离线</span>')+'</div>';
+    h+='<div class="st">电量 '+(i.battery!=null?i.battery+'%':'—')+' · 信号 '+(i.signal!=null?i.signal:'—')+' · 活跃 '+fmtTime(i.last_active_utc)+'</div>';
+    h+='<div class="st muted">'+escHtml(i.uid||'')+'</div></div>';
+  }else{
+    h+='<div class="dev-card"><div class="nm">设备</div><div class="st muted">无设备（先去设备页登录）</div></div>';
+  }
+  h+='<div class="dev-card"><div class="nm">中继 <span class="muted">传输</span></div>';
+  h+='<div class="st">模式 '+(s.transport||'—')+'（'+(s.transport_detail||'—')+'）</div>';
+  h+='<div class="st">'+(s.running?'LIVE 解码'+s.decoded:'空闲')+' · 订阅'+(s.subs||0)+'</div></div>';
+  box.innerHTML=h;
+}
+function sdLanLog(msg){  var el=document.getElementById('lan-sd-log');
   if(!el)return;
   var t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
   var lines=el.textContent.split('\n');
@@ -1529,31 +2871,54 @@ function sdLanList(){
     renderSdGrid('lan-sd-grid',evs,'lan');
   }).catch(function(e){sdLiveStop();if(st)st.textContent='请求失败：'+e;sdLanLog('请求失败: '+e);});
 }
-function sdList(){
-  var st=document.getElementById('sd-status');
-  var hours=parseInt((document.getElementById('sd-hours')||{}).value||'24',10)||24;
-  var secs=parseInt((document.getElementById('sd-secs')||{}).value||'40',10)||40;
-  var uid=curUid();
-  if(!uid){if(st)st.textContent='请先选择设备';return;}
-  if(st)st.textContent='查询中（局域网直连P2P，最多等'+secs+'s）…';
-  sdLiveStart('sd-grid','sd-status','side','，点条目即播右侧播放器');
-  post('/api/sd/list',{uid:uid,hours:hours,secs:secs,via:'direct'}).then(function(r){
-    sdLiveStop();
-    var g=document.getElementById('sd-grid');
-    if(r.error){if(st)st.textContent=r.error;if(g)g.innerHTML='<span class="muted">'+escHtml(r.error)+'</span>';return;}
-    var evs=r.events||[];
-    _sdEvs=evs;
-    if(st)st.textContent='共 '+evs.length+' 段（'+(r.source||'?')+'，用时'+(r.elapsed||'?')+'s'+(r.early?'·提前返回':'')+'），点条目即播右侧播放器';
-    renderSdGrid('sd-grid',evs,'side');
-  }).catch(function(e){sdLiveStop();if(st)st.textContent='请求失败：'+e;});
-}
 var _vodTimer=null;
+function sdVideoEl(where){return document.getElementById(where==='lan'?'lan-sd-vid':'side-vid');}
+function sdHlsDestroy(v){if(!v)return;if(v._hls){try{v._hls.destroy();}catch(e){}v._hls=null;}v._hlsFor=null;}
+function sdEnsureHlsJs(cb){
+  if(window.Hls){cb(true);return;}
+  if(document.getElementById('hlsjs')){
+    var _t=setInterval(function(){if(window.Hls){clearInterval(_t);cb(true);}},500);
+    setTimeout(function(){clearInterval(_t);cb(!!window.Hls);},15000);
+    return;
+  }
+  var sc=document.createElement('script');sc.id='hlsjs';sc.src='/hls.js';
+  sc.onload=function(){cb(!!window.Hls);};sc.onerror=function(){cb(false);};
+  document.head.appendChild(sc);
+}
+function sdHlsAttach(v,url,start,where){
+  if(!v||v._hlsFor===start)return;
+  sdEnsureHlsJs(function(ok){
+    if(!v||v._hlsFor===start||!ok)return;
+    sdHlsDestroy(v);
+    if(window.Hls&&Hls.isSupported()){
+      var h=new Hls({maxBufferLength:15,liveSyncDurationCount:2});
+      v._hls=h;v._hlsFor=start;
+      h.loadSource(url);h.attachMedia(v);
+      h.on(Hls.Events.MANIFEST_PARSED,function(){try{var p=v.play();if(p&&p.catch)p.catch(function(){});}catch(e){}});
+    }else if(v.canPlayType&&v.canPlayType('application/vnd.apple.mpegurl')){
+      v._hlsFor=start;v.src=url;
+      try{var p2=v.play();if(p2&&p2.catch)p2.catch(function(){});}catch(e){}
+    }else{return;}
+    if(where==='lan'){
+      v.style.display='block';
+      var pi=document.getElementById('lan-sd-playinfo');
+      if(pi)pi.innerHTML='实时播放中（HLS） <a href="/api/sd/vod_file?start='+start+'" download>下载</a>';
+      v.scrollIntoView({behavior:'smooth',block:'nearest'});
+    }else if(where==='side'){
+      var vi=document.getElementById('side-info');
+      if(vi)vi.textContent='实时播放中（HLS） start='+start;
+      var dl=document.getElementById('side-dl');
+      if(dl)dl.href='/api/sd/vod_file?start='+start;
+    }
+  });
+}
 function sdVodPlay(i,where){
   var e=_sdEvs[i];
   if(!e||!e.start)return;
   var uid=curUid();
   if(!uid)return;
   var info=(e.start_h||e.start)+' · '+(e.len_s||'?')+'s';
+  sdHlsDestroy(sdVideoEl(where));
   if(where==='lan'){
     var pi=document.getElementById('lan-sd-playinfo');
     if(pi)pi.textContent='点播中 '+info+' …';
@@ -1575,7 +2940,7 @@ function sdVodPlay(i,where){
       return;
     }
     if(_vodTimer)clearInterval(_vodTimer);
-    _vodTimer=setInterval(function(){sdVodPoll(e.start,where);},5000);
+    _vodTimer=setInterval(function(){sdVodPoll(e.start,where);},2000);
     sdVodPoll(e.start,where);
   }).catch(function(ex){
     sdLanLog('点播请求失败: '+ex);
@@ -1584,15 +2949,30 @@ function sdVodPlay(i,where){
 function sdVodPoll(start,where){
   get('/api/sd/vod_status').then(function(s){
     var log=(s.log||[]).join(' | ').slice(-160);
-    if(where==='lan'){var pi=document.getElementById('lan-sd-playinfo');if(pi)pi.textContent='转码中 '+start+' … '+log;}
-    sdLanLog('vod '+start+' running='+s.running+' '+(s.mp4||log));
-    if(s.mp4&&(!s.running||s.start===start)){
+    var v=sdVideoEl(where);
+    var attached=!!(v&&v._hlsFor===start);
+    if(s.hls&&(s.start===start)&&!attached){
+      if(where==='lan'){var pi0=document.getElementById('lan-sd-playinfo');if(pi0)pi0.textContent='取到流，实时播放中 '+start+' …';}
+      sdLanLog('vod '+start+' hls ready segs='+s.hls_segs);
+      sdHlsAttach(v,s.hls,start,where);
+    }else if(!attached){
+      if(where==='lan'){var pi=document.getElementById('lan-sd-playinfo');if(pi)pi.textContent='取流中 '+start+' … '+log;}
+    }
+    sdLanLog('vod '+start+' running='+s.running+' hls='+!!s.hls+' '+(s.mp4||log));
+    if(!s.running){
       if(_vodTimer){clearInterval(_vodTimer);_vodTimer=null;}
-      sdVodDone(start,where);
-    }else if(!s.running&&!s.mp4){
-      if(_vodTimer){clearInterval(_vodTimer);_vodTimer=null;}
-      if(where==='lan'){var p3=document.getElementById('lan-sd-playinfo');if(p3)p3.textContent='点播失败 '+log;}
-      else{playSide('about:blank','点播失败 '+log);}
+      if(s.mp4&&(s.start===start)){
+        if(attached){
+          var mp4url='/api/sd/vod_file?start='+start;
+          if(where==='lan'){var pi2=document.getElementById('lan-sd-playinfo');if(pi2)pi2.innerHTML='正在播（HLS） <a href="'+mp4url+'" download>下载</a>';}
+          else{var dl=document.getElementById('side-dl');if(dl)dl.href=mp4url;var vi=document.getElementById('side-info');if(vi)vi.textContent='正在播（HLS） start='+start;}
+        }else{
+          sdVodDone(start,where);
+        }
+      }else if(!attached){
+        if(where==='lan'){var p3=document.getElementById('lan-sd-playinfo');if(p3)p3.textContent='点播失败 '+log;}
+        else{playSide('about:blank','点播失败 '+log);}
+      }
     }
   }).catch(function(){});
 }
@@ -1669,6 +3049,8 @@ function enterApp(){
   document.getElementById('login-page').style.display='none';
   document.getElementById('app-page').style.display='block';
   document.getElementById('navtabs').style.display='flex';
+  try{renderLiveFuncs();}catch(e){}
+  try{renderRelayFuncs();}catch(e){}
   refreshSessionInfo();
   loadDevices();
 }
@@ -1736,18 +3118,20 @@ function switchDevTab(uid){
 }
 function refreshSessionInfo(){
   get('/api/session').then(function(s){
+    _sessionSnap=s||null;
     var label=(s&&s.logged_in)?('已登录 '+(s.account||'—')+' · region '+(s.region||'—')):'未登录';
+    if(s&&s.auto)label+=' · 自动续登开';
     document.getElementById('login-user').textContent=label;
-    document.getElementById('user-session').textContent=label+'（会话落容器 /data，重启保持）';
+    document.getElementById('user-session').textContent=label+'（凭证落容器 /data 600，重启/过期自动续）';
   }).catch(function(){document.getElementById('login-user').textContent='—';});
   loadUserStats();
+  renderUserParams();
 }
 function loadUserStats(){
   var el=document.getElementById('user-devstats');
   if(!el)return;
-  get('/api/devices').then(function(d){
-    if(d.error){el.textContent=d.error;return;}
-    var items=d.items||[];
+  if((_devs||[]).length){
+    var items=_devs;
     var on=0, off=0, mine=0, shared=0;
     items.forEach(function(i){
       if(i.online)on++;else off++;
@@ -1755,6 +3139,13 @@ function loadUserStats(){
     });
     el.innerHTML='共 '+items.length+' 台 · 在线 '+on+' / 离线 '+off+
       ' · 本人 '+mine+' / 他人分享 '+shared;
+    return;
+  }
+  get('/api/devices').then(function(d){
+    if(d.error){el.textContent=d.error;return;}
+    storeDevs(d);
+    renderUserParams();
+    loadUserStats();
   }).catch(function(e){el.textContent='加载失败：'+e;});
 }
 function showLogin(){
@@ -1783,7 +3174,9 @@ setInterval(function(){
   var st=document.getElementById('stats');
   var ls=document.getElementById('live-stats');
   var rs=document.getElementById('relay-stats');
-  if(!st&&!ls&&!rs)return;
+  var li=document.getElementById('live-info');
+  var ri=document.getElementById('relay-info');
+  if(!st&&!ls&&!rs&&!li&&!ri)return;
   fetch('/stats').then(function(r){return r.json();}).then(function(s){
     var txt=(s.running?'LIVE':'idle')+' decoded='+s.decoded+' nals='+s.nals+
       ' subs='+s.subs+' spawns='+s.spawns+' uptime='+s.uptime_s+'s';
@@ -1800,6 +3193,8 @@ setInterval(function(){
       if(bs[i].getAttribute('data-m')===s.transport){ bs[i].classList.add('on'); }
       else { bs[i].classList.remove('on'); }
     }
+    if(s.sess){_sessSnap=s.sess;renderLiveInfo();var se=document.getElementById('sess-status');if(se)se.textContent=sessText(s.sess);}
+    _statsSnap=s;renderRelayInfo();
   }).catch(function(){});
 },2000);
 </script>
@@ -1861,14 +3256,14 @@ class Handler(BaseHTTPRequestHandler):
                        json.dumps(
                            {"logged_in": bool(_cloud_token),
                             "account": _cloud_account,
-                            "region": _cloud_region}).encode())
+                            "region": _cloud_region,
+                            "auto": _has_saved_cloud_creds()}).encode())
         elif path == "/api/devices":
-            if not _cloud_token:
+            if not _cloud_token and not _auto_login():
                 self._send(401, "application/json",
                            json.dumps({"error": "not logged in"}).encode())
                 return
-            data, err = _cloud_call("/api/v2/user/device_list", {},
-                                    _cloud_token)
+            data, err = _cloud_call_auto("/api/v2/user/device_list", {})
             if err:
                 self._send(502, "application/json",
                            json.dumps({"error": err}).encode())
@@ -2033,6 +3428,11 @@ class Handler(BaseHTTPRequestHandler):
             snap["transport"] = tr["mode"]
             snap["transport_applied"] = tr["applied"]
             snap["transport_detail"] = tr["detail"]
+            snap["live_hls"] = {"ready": _live_hls_ready(),
+                                "segs": _live_hls_segs(),
+                                "n": snap["hls_n"], "bytes": snap["hls_bytes"],
+                                "err": snap["hls_err"]}
+            snap["sess"] = sess_status()
             self._send(200, "application/json",
                        json.dumps(snap).encode())
         elif path == "/snap.jpg":
@@ -2086,16 +3486,57 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json",
                        json.dumps(read_sd_live()).encode())
             return
+        elif path == "/api/sess/status":
+            self._send(200, "application/json",
+                       json.dumps(sess_status()).encode())
+            return
+        elif path == "/api/live/hls":
+            qs = (self.path.split("?", 1)[1]
+                  if "?" in self.path else "")
+            q = {}
+            for kv in qs.split("&"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    q[k] = v
+            import re as _re2
+            fn = q.get("file", "")
+            if (not _re2.fullmatch(r"[\w.\-]+", fn)
+                    or not fn.endswith((".m3u8", ".ts"))
+                    or "/" in fn or "\\" in fn):
+                self._send(400, "text/plain", b"bad hls request")
+                return
+            fp = os.path.join(HLSDIR, fn)
+            if not (os.path.isfile(fp) and os.path.getsize(fp) > 0):
+                self._send(404, "text/plain", b"hls not ready")
+                return
+            try:
+                with open(fp, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                self._send(404, "text/plain", b"hls not ready")
+                return
+            ctype = ("application/vnd.apple.mpegurl"
+                     if fn.endswith(".m3u8") else "video/mp2t")
+            self._send(200, ctype, body)
+            return
         elif path == "/api/sd/vod_status":
             with VOD_LOCK:
                 mp4 = VOD_RUN["mp4"]
+                hlsdir = VOD_RUN.get("hls_dir") or ""
                 self._send(200, "application/json",
                            json.dumps(
                                {"running": VOD_RUN["running"],
                                 "start": VOD_RUN["start"],
                                 "log": list(VOD_RUN["log"][-20:]),
                                 "mp4": (os.path.basename(mp4)
-                                        if mp4 else None)}).encode())
+                                        if mp4 else None),
+                                "hls_ready": bool(
+                                    VOD_RUN.get("hls_ready")),
+                                "hls_segs": _vod_hls_segs(hlsdir),
+                                "hls": ("/api/sd/hls?start=%s&file=index.m3u8"
+                                        % VOD_RUN["start"])
+                                if VOD_RUN.get("hls_ready") else None}
+                               ).encode())
             return
         elif path == "/api/sd/vod_file":
             qs = (self.path.split("?", 1)[1]
@@ -2121,8 +3562,80 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, "video/mp4", body)
             return
+        elif path == "/api/sd/hls":
+            qs = (self.path.split("?", 1)[1]
+                  if "?" in self.path else "")
+            q = {}
+            for kv in qs.split("&"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    q[k] = v
+            try:
+                start = int(q.get("start", "0") or 0)
+            except ValueError:
+                start = 0
+            import re as _re
+            fn = q.get("file", "")
+            if (not start or not _re.fullmatch(r"[\w.\-]+", fn)
+                    or not fn.endswith((".m3u8", ".m4s", ".mp4"))
+                    or "/" in fn or "\\" in fn):
+                self._send(400, "text/plain", b"bad hls request")
+                return
+            fp = os.path.join(VODDIR, "hls_%s" % start, fn)
+            if not (os.path.isfile(fp) and os.path.getsize(fp) > 0):
+                self._send(404, "text/plain", b"hls not ready")
+                return
+            try:
+                with open(fp, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                self._send(404, "text/plain", b"hls not ready")
+                return
+            ctype = {"m3u8": "application/vnd.apple.mpegurl",
+                     "m4s": "video/iso.segment",
+                     "mp4": "video/mp4"}[fn.rsplit(".", 1)[1]]
+            self._send(200, ctype, body)
+            return
+        elif path == "/hls.js":
+            self._send_hls_js()
+            return
         else:
             self._send(404, "text/plain", b"not found")
+
+    def _send_hls_js(self):
+        """Serve hls.js (cached under /data, fetched once from CDN)."""
+        import urllib.request as _url
+        js = os.environ.get("UBOX_HLSJS_FILE", "/data/hls.min.js")
+        try:
+            if os.path.isfile(js) and os.path.getsize(js) > 100000:
+                with open(js, "rb") as fh:
+                    self._send(200, "application/javascript", fh.read())
+                return
+        except OSError:
+            pass
+        try:
+            req = _url.Request(
+                "https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js",
+                headers={"User-Agent": "ubox-addon"})
+            with _url.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            if len(data) > 100000:
+                try:
+                    with open(js, "wb") as fh:
+                        fh.write(data)
+                    try:
+                        os.chmod(js, 0o644)
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+                self._send(200, "application/javascript", data)
+                return
+        except Exception as e:
+            self._send(502, "text/plain",
+                       ("hls.js fetch failed: %s" % str(e)[:120]).encode())
+            return
+        self._send(502, "text/plain", b"hls.js fetch failed")
 
     def _read_json(self):
         try:
@@ -2156,6 +3669,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, "application/json",
                            json.dumps({"error": err}).encode())
                 return
+            _save_cloud_creds(account, password, region)
             self._send(200, "application/json",
                        json.dumps({"ok": True, "account": _cloud_account,
                                    "region": _cloud_region}).encode())
@@ -2183,7 +3697,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/cloud/list":
             body = self._read_json()
-            if not _cloud_token:
+            if not _cloud_token and not _auto_login():
                 self._send(401, "application/json",
                            json.dumps({"error": "not logged in"}).encode())
                 return
@@ -2191,8 +3705,8 @@ class Handler(BaseHTTPRequestHandler):
             req = {"begin": body.get("begin", now - 7 * 86400),
                    "end": body.get("end", now),
                    "device_uids": body.get("device_uids", [])}
-            data, err = _cloud_call("/api/user/qry/cloudvideo/list/v2",
-                                    req, _cloud_token)
+            data, err = _cloud_call_auto("/api/user/qry/cloudvideo/list/v2",
+                                         req)
             if err:
                 self._send(502, "application/json",
                            json.dumps({"error": err}).encode())
@@ -2202,11 +3716,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/cloud/url":
             body = self._read_json()
-            if not _cloud_token:
+            if not _cloud_token and not _auto_login():
                 self._send(401, "application/json",
                            json.dumps({"error": "not logged in"}).encode())
                 return
-            data, err = _cloud_call(
+            data, err = _cloud_call_auto(
                 "/api/user/qry/cloudvideo/get_video_url", {
                     "bucket_name": body.get("bucket_name"),
                     "cloud_provider": body.get("cloud_provider"),
@@ -2215,7 +3729,7 @@ class Handler(BaseHTTPRequestHandler):
                     "guid": body.get("guid") or body.get("itemid"),
                     "image": body.get("image"),
                     "uid": body.get("uid", ""),
-                }, _cloud_token)
+                })
             if err:
                 self._send(502, "application/json",
                            json.dumps({"error": err}).encode())
@@ -2230,13 +3744,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, "application/json",
                            json.dumps({"error": "need uid"}).encode())
                 return
-            if not _cloud_token:
+            if not _cloud_token and not _auto_login():
                 self._send(401, "application/json",
                            json.dumps({"error": "not logged in"}).encode())
                 return
-            data, err = _cloud_call(
-                "/api/user/qry/device/get_webrtc_token", {"uid": uid},
-                _cloud_token)
+            data, err = _cloud_call_auto(
+                "/api/user/qry/device/get_webrtc_token", {"uid": uid})
             if err:
                 self._send(502, "application/json",
                            json.dumps({"error": err}).encode())
@@ -2266,12 +3779,27 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 SD_RUN["running"] = True
                 SD_RUN["t0"] = int(time.time())
-                _load_device()
-                username = DEV["username"] or OPT.get("username") or "admin"
-                payload, code = run_sdlist(uid, username,
-                                           DEV["password"],
-                                           body.get("hours", 24),
-                                           body.get("secs", 40))
+                if sess_usable(uid):
+                    now = int(time.time())
+                    hours = max(1, min(168, int(body.get("hours", 24)
+                                               or 24)))
+                    secs = body.get("secs", 40)
+                    try:
+                        secs = max(15, min(90, int(secs or 40)))
+                    except (TypeError, ValueError):
+                        secs = 40
+                    payload, code = sess_cmd_list(
+                        uid, now - hours * 3600, now, timeout=secs + 10)
+                else:
+                    username, password, derr = _resolve_device(uid)
+                    if derr:
+                        payload, code = ({"error": derr, "events": []},
+                                         401 if "not logged in" in derr
+                                         else 503)
+                    else:
+                        payload, code = run_sdlist(
+                            uid, username, password,
+                            body.get("hours", 24), body.get("secs", 40))
             except Exception as e:
                 payload, code = ({"error": "SD查询异常：%s" % str(e)[:160],
                                   "events": []}, 500)
@@ -2302,14 +3830,11 @@ class Handler(BaseHTTPRequestHandler):
                            json.dumps({"error": "need uid and start"})
                            .encode())
                 return
-            _load_device()
-            username = DEV["username"] or OPT.get("username") or "admin"
-            password = DEV["password"]
-            if not password:
-                self._send(503, "application/json",
-                           json.dumps({"error": "device password not "
-                                                "configured (enter on web "
-                                                "page)"}).encode())
+            username, password, derr = _resolve_device(uid)
+            if derr:
+                self._send(401 if "not logged in" in derr else 503,
+                           "application/json",
+                           json.dumps({"error": derr}).encode())
                 return
             mp4 = os.path.join(VODDIR, "回放_%s.mp4" % start)
             if os.path.isfile(mp4) and os.path.getsize(mp4) > 0:
@@ -2328,32 +3853,63 @@ class Handler(BaseHTTPRequestHandler):
                            .encode())
                 return
             try:
-                with VOD_LOCK:
-                    if VOD_RUN["running"]:
-                        self._send(409, "application/json",
-                                   json.dumps(
-                                       {"error": "SD点播进行中，稍后再试"})
-                                   .encode())
-                        return
-                    VOD_RUN["running"] = True
-                    VOD_RUN["start"] = start
-                    VOD_RUN["log"] = []
-                    VOD_RUN["mp4"] = None
+                if VOD_RUN["running"]:
+                    self._send(409, "application/json",
+                               json.dumps(
+                                   {"error": "SD点播进行中，稍后再试"})
+                               .encode())
+                    return
+                VOD_RUN["running"] = True
+                VOD_RUN["start"] = start
+                VOD_RUN["log"] = []
+                VOD_RUN["mp4"] = None
+                VOD_RUN["hls_ready"] = False
+                VOD_RUN["hls_dir"] = ""
                 secs = min(45 + length * 2, 400)
+                daemon_vod = sess_usable(uid)
                 threading.Thread(target=_vod_worker,
                                  args=(uid, username, password, start,
-                                       length, body.get("reqseq", 3)),
+                                       length, body.get("reqseq", 3),
+                                       daemon_vod),
                                  daemon=True).start()
-            except Exception:
+            except Exception as e:
                 with VOD_LOCK:
                     VOD_RUN["running"] = False
-                VOD_LOCK.release()
-                raise
-            else:
+                _vod_log("VOD启动失败：%s" % str(e)[:120])
+                self._send(500, "application/json",
+                           json.dumps({"error": "vod start failed"})
+                           .encode())
+                return
+            finally:
                 VOD_LOCK.release()
             self._send(200, "application/json",
                        json.dumps({"ok": True, "start": start,
                                    "cached": False, "secs": secs}).encode())
+            return
+        if path == "/api/sess/connect":
+            body = self._read_json()
+            uid = (body.get("uid") or "").strip()
+            if not uid:
+                self._send(400, "application/json",
+                           json.dumps({"error": "need uid"}).encode())
+                return
+            username, password, derr = _resolve_device(uid)
+            if derr:
+                self._send(401 if "not logged in" in derr else 503,
+                           "application/json",
+                           json.dumps({"error": derr}).encode())
+                return
+            ok, msg = sess_start(uid, username, password)
+            self._send(200 if ok else 504, "application/json",
+                       json.dumps({"ok": ok,
+                                   "msg" if ok else "error": msg,
+                                   "status": sess_status()}).encode())
+            return
+        if path == "/api/sess/disconnect":
+            was = sess_stop()
+            self._send(200, "application/json",
+                       json.dumps({"ok": True,
+                                   "was_connected": was}).encode())
             return
         if path == "/api/device-login":
             body = self._read_json()
@@ -2364,6 +3920,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, "application/json",
                            json.dumps(
                                {"error": "need uid and password"}).encode())
+                return
+            if (DEV["uid"] == uid and DEV["username"] == username
+                    and DEV["password"] == password):
+                self._send(200, "application/json",
+                           json.dumps({"ok": True, "uid": uid,
+                                       "username": username,
+                                       "restarted": False,
+                                       "cached": True}).encode())
                 return
             DEV["uid"] = uid
             DEV["username"] = username
@@ -2378,6 +3942,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/logout":
             _clear_cloud_session()
+            _clear_cloud_creds()
             self._send(200, "application/json",
                        json.dumps({"ok": True}).encode())
             return
@@ -2415,7 +3980,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     _load_cloud_session()
+    _load_cloud_creds()
     _load_device()
+    if not _cloud_token and _has_saved_cloud_creds():
+        threading.Thread(target=_auto_login, daemon=True).start()
     print("options: stream=%d fps=%d idle=%ds transport=%s http_auth=%s cloud=%s device=%s" % (
         OPT["stream"], OPT["fps"], OPT["idle_timeout"],
         OPT["transport"], "on" if OPT.get("http_password") else "off",
@@ -2424,6 +3992,7 @@ def main():
         flush=True)
     apply_transport(OPT["transport"])
     threading.Thread(target=supervisor, daemon=True).start()
+    threading.Thread(target=sess_supervisor, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", OPT["port"]), Handler)
     print("serving on :%d" % OPT["port"], flush=True)
     srv.serve_forever()
