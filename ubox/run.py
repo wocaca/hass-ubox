@@ -16,6 +16,8 @@ Transport: auto|relay|direct enforced via iptables (needs NET_ADMIN).
   direct = drop P4P relays (udp/20001). Effective path is lib-internal;
   /stats reports the requested mode plus whether rules applied.
 HTTP auth: options http_username/http_password; empty password = open
+(stream endpoints also accept ?key=<http_password> for browsers that
+strip embedded user:pass@).
   (backwards compatible), non-empty = every endpoint requires Basic auth.
 """
 import base64
@@ -33,6 +35,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -3238,6 +3241,20 @@ class Handler(BaseHTTPRequestHandler):
         expect = ("%s:%s" % (want_u, want_p)).encode("utf-8")
         return hmac.compare_digest(cred, expect)
 
+    def _query_key_ok(self):
+        # 浏览器会剥掉 URL 里嵌的 user:pass@，但 query 会原样送达：
+        # /video.mjpg?key=<http_password> 免弹框直开即唤醒即播。
+        # 只放行两个只读流端点，页面与 API 照旧走 Basic。
+        want_p = OPT.get("http_password", "")
+        if not want_p:
+            return False
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        for kv in qs.split("&"):
+            if kv.startswith("key="):
+                return hmac.compare_digest(
+                    urllib.parse.unquote(kv[4:]), want_p)
+        return False
+
     def _deny_auth(self):
         body = b"auth required"
         self.send_response(401)
@@ -3258,10 +3275,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if not self._auth_ok():
+        path = self.path.split("?", 1)[0]
+        if not self._auth_ok() and not (
+                path in ("/video.mjpg", "/snap.jpg")
+                and self._query_key_ok()):
             self._deny_auth()
             return
-        path = self.path.split("?", 1)[0]
         if path == "/":
             self._send(200, "text/html; charset=utf-8",
                        PAGE.encode("utf-8"))
