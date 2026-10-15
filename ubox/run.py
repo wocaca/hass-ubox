@@ -1001,16 +1001,31 @@ def apply_transport(mode):
     print("transport %s: %s" % (mode, detail), flush=True)
     return ok
 
-ST = {"t0": time.time(), "decoded": 0, "nals": 0, "restarts": 0,
-      "spawns": 0, "running": False, "served": 0, "subs": 0,
-      "last_sub_t": 0.0, "hls_n": 0, "hls_bytes": 0, "hls_err": ""}
-LATEST = {"jpg": None, "seq": 0, "t": 0.0}
+def _new_branch_state():
+    return {"t0": time.time(), "decoded": 0, "nals": 0, "restarts": 0,
+            "spawns": 0, "running": False, "served": 0, "subs": 0,
+            "last_sub_t": 0.0, "hls_n": 0, "hls_bytes": 0, "hls_err": ""}
+
+
+def _new_branch(bid, name, transport, rundir, hlsdir):
+    return {"id": bid, "name": name, "transport": transport,
+            "PIPE": {"cap": None, "ff": None, "rundir": "", "hls": None,
+                     "hlsfifo": None, "hlslog": None},
+            "ST": _new_branch_state(),
+            "LATEST": {"jpg": None, "seq": 0, "t": 0.0},
+            "PRIME": {"on": False, "nxt": 0},
+            "WAKE": threading.Event(),
+            "rundir": rundir, "hlsdir": hlsdir,
+            "pid": None, "pidrules": [], "iso": "unset"}
+
+
+# 双分支：video1=直连优先(direct)，video2=中继(relay)。
+# /video.mjpg 是两路的主备合并（取最新鲜帧），/video1/2.mjpg 各看一路。
+BR = {"1": _new_branch("1", "video1", "direct",
+                       "/tmp/ubox_run1", "/tmp/ubox_live_hls1"),
+      "2": _new_branch("2", "video2", "relay",
+                       "/tmp/ubox_run2", "/tmp/ubox_live_hls2")}
 LOCK = threading.Lock()
-PIPE = {"cap": None, "ff": None, "rundir": "", "hls": None,
-        "hlsfifo": None, "hlslog": None}
-HLSDIR = "/tmp/ubox_live_hls"
-PRIME = {"on": False, "nxt": 0}
-WAKE = threading.Event()
 SD_LOCK = threading.Lock()
 SD_RUN = {"running": False, "t0": 0}
 SD_RUNDIR = "/tmp/ubox_sd"
@@ -1549,7 +1564,7 @@ def stable_read(path, tries=5, gap=0.05):
     return None
 
 
-def split_jpegs(proc):
+def split_jpegs(proc, br):
     buf = bytearray()
     while True:
         try:
@@ -1571,10 +1586,10 @@ def split_jpegs(proc):
             jpg = bytes(buf[s:e + 2])
             del buf[:e + 2]
             with LOCK:
-                LATEST["jpg"] = jpg
-                LATEST["seq"] += 1
-                LATEST["t"] = time.time()
-                ST["decoded"] += 1
+                br["LATEST"]["jpg"] = jpg
+                br["LATEST"]["seq"] += 1
+                br["LATEST"]["t"] = time.time()
+                br["ST"]["decoded"] += 1
 
 
 def client_gone(conn):
@@ -1591,13 +1606,67 @@ def client_gone(conn):
         return True
 
 
-def stop_pipeline():
-    cap, ff = PIPE["cap"], PIPE["ff"]
-    PIPE["cap"], PIPE["ff"] = None, None
-    fhls, whls = PIPE.get("hls"), PIPE.get("hlsfifo")
-    PIPE["hls"], PIPE["hlsfifo"] = None, None
-    hlslog = PIPE.get("hlslog")
-    PIPE["hlslog"] = None
+def _branch_rule(br, pid):
+    # 每分支只封自己 qemu 进程的包：direct 封全部中继端口，
+    # relay 封局域网发现端口；两分支互不干扰（全局规则是互斥的，
+    # 分支起流时会自动清掉，见 branch_isolate）。
+    port = RELAY_PORT if br["transport"] == "direct" else LANDISC_PORT
+    return ["-m", "owner", "--pid-owner", str(pid), "-p", "udp",
+            "--dport", str(port),
+            "-m", "comment", "--comment", "ubox-%s" % br["name"]]
+
+
+def branch_isolate(br, pid):
+    """Enforce this branch's path on its own qemu PID only."""
+    if not IPTABLES:
+        br["iso"] = "no-iptables: shared network, path not forced"
+        return False
+    for m in ("relay", "direct"):
+        _ipt("-D", "OUTPUT", *transport_rule(m))
+    with LOCK:
+        TR["applied"] = False
+        TR["detail"] = ("dual: globals cleared for branch isolation "
+                        "(global %s recorded)" % OPT["transport"])
+    rule = _branch_rule(br, pid)
+    _ipt("-D", "OUTPUT", *rule)
+    rc, out = _ipt("-A", "OUTPUT", *rule)
+    ok = rc == 0 and _ipt_has(rule)
+    br["pidrules"] = [rule] if ok else []
+    br["pid"] = pid
+    via = rule[rule.index("--dport") + 1]
+    br["iso"] = ("pid-owner drop udp/%s (%s-only)" % (via, br["transport"])
+                 if ok else ("pid-owner failed: %s" % out))
+    print("branch %s isolate pid=%s: %s" % (br["name"], pid, br["iso"]),
+          flush=True)
+    return ok
+
+
+def branch_unisolate(br):
+    for rule in br.get("pidrules", []):
+        _ipt("-D", "OUTPUT", *rule)
+    br["pidrules"] = []
+    br["pid"] = None
+    if not any(b["ST"]["running"] for b in BR.values()):
+        apply_transport(OPT["transport"])
+
+
+def _stop_all_branches():
+    for br in BR.values():
+        stop_pipeline(br)
+
+
+def _wake_all_branches():
+    for br in BR.values():
+        br["WAKE"].set()
+
+
+def stop_pipeline(br):
+    cap, ff = br["PIPE"]["cap"], br["PIPE"]["ff"]
+    br["PIPE"]["cap"], br["PIPE"]["ff"] = None, None
+    fhls, whls = br["PIPE"].get("hls"), br["PIPE"].get("hlsfifo")
+    br["PIPE"]["hls"], br["PIPE"]["hlsfifo"] = None, None
+    hlslog = br["PIPE"].get("hlslog")
+    br["PIPE"]["hlslog"] = None
     for p in (ff, cap):
         if p is None:
             continue
@@ -1639,11 +1708,12 @@ def stop_pipeline():
         except Exception:
             pass
     with LOCK:
-        ST["running"] = False
+        br["ST"]["running"] = False
+    branch_unisolate(br)
 
 
-def _live_hls_ready():
-    idx = os.path.join(HLSDIR, "index.m3u8")
+def _live_hls_ready(hlsdir):
+    idx = os.path.join(hlsdir, "index.m3u8")
     try:
         if os.path.getsize(idx) <= 0:
             return False
@@ -1653,14 +1723,14 @@ def _live_hls_ready():
         return False
 
 
-def _live_hls_segs():
+def _live_hls_segs(hlsdir):
     try:
-        return len(glob.glob(os.path.join(HLSDIR, "seg*.ts")))
+        return len(glob.glob(os.path.join(hlsdir, "seg*.ts")))
     except Exception:
         return 0
 
 
-def live_hls_feeder(rundir, fifo_path):
+def live_hls_feeder(rundir, fifo_path, br):
     """Feed primed v_*.bin chunks (raw Annex-B) to the HLS ffmpeg fifo.
 
     The -c copy muxer needs clean codec params at probe time (a decoder
@@ -1669,7 +1739,7 @@ def live_hls_feeder(rundir, fifo_path):
     VPS NAL is seen (buffered across chunk boundaries); everything from
     there passes through.
     """
-    dbg = os.path.join(HLSDIR, "feeder.log")
+    dbg = os.path.join(br["hlsdir"], "feeder.log")
 
     def _dbg(msg):
         try:
@@ -1688,7 +1758,7 @@ def live_hls_feeder(rundir, fifo_path):
         _dbg("open-fail:%s" % e)
         return
     _dbg("fifo-open")
-    PIPE["hlsfifo"] = w
+    br["PIPE"]["hlsfifo"] = w
 
     def _vps_off(b):
         i = b.find(b"\x00\x00\x00\x01")
@@ -1700,13 +1770,13 @@ def live_hls_feeder(rundir, fifo_path):
 
     try:
         n, seeking, pend = 0, True, b""
-        while PIPE.get("hls") is not None:
-            while not PRIME["on"]:
+        while br["PIPE"].get("hls") is not None:
+            while not br["PRIME"]["on"]:
                 time.sleep(0.2)
-                if PIPE.get("hls") is None:
+                if br["PIPE"].get("hls") is None:
                     return
-            if n < PRIME["nxt"]:
-                n = PRIME["nxt"]
+            if n < br["PRIME"]["nxt"]:
+                n = br["PRIME"]["nxt"]
             path = os.path.join(rundir, "v_%d.bin" % n)
             if not os.path.isfile(path):
                 time.sleep(0.15)
@@ -1725,55 +1795,58 @@ def live_hls_feeder(rundir, fifo_path):
                     continue
                 b, pend, seeking = pend[off:], b"", False
                 with LOCK:
-                    ST["hls_err"] = "vps@n=%d" % n
+                    br["ST"]["hls_err"] = "vps@n=%d" % n
                 _dbg("vps@n=%d" % n)
             try:
                 w.write(b)
                 w.flush()
             except (BrokenPipeError, ValueError, OSError) as e:
                 with LOCK:
-                    ST["hls_err"] = "write:%s" % str(e)[:60]
+                    br["ST"]["hls_err"] = "write:%s" % str(e)[:60]
                 return
             with LOCK:
-                ST["hls_n"] += 1
-                ST["hls_bytes"] += len(b)
+                br["ST"]["hls_n"] += 1
+                br["ST"]["hls_bytes"] += len(b)
             n += 1
     except Exception as e:
         with LOCK:
-            ST["hls_err"] = "feeder:%s" % str(e)[:80]
+            br["ST"]["hls_err"] = "feeder:%s" % str(e)[:80]
     finally:
         try:
             w.close()
         except Exception:
             pass
-        if PIPE.get("hlsfifo") is w:
-            PIPE["hlsfifo"] = None
+        if br["PIPE"].get("hlsfifo") is w:
+            br["PIPE"]["hlsfifo"] = None
 
 
-def run_pipeline():
-    rundir = "/tmp/ubox_run"
+def run_pipeline(br):
+    rundir = br["rundir"]
+    hlsdir = br["hlsdir"]
     os.makedirs(rundir, exist_ok=True)
     for f in glob.glob(os.path.join(rundir, "*")):
         try:
             os.remove(f)
         except OSError:
             pass
-    PIPE["rundir"] = rundir
+    br["PIPE"]["rundir"] = rundir
     _load_device()
     username = DEV["username"] or OPT.get("username") or "admin"
     if not DEV["uid"] or not DEV["password"]:
-        print("no device uid/password (enter on web page), "
-              "pipeline not started", flush=True)
+        print("branch %s: no device uid/password (enter on web page), "
+              "pipeline not started" % br["name"], flush=True)
         return
     for need in (QEMU, REHOST):
         if not (os.path.isfile(need) and os.access(need, os.X_OK)):
-            print("missing executable: %s" % need, flush=True)
+            print("branch %s: missing executable: %s" % (br["name"], need),
+                  flush=True)
             return
     cap = subprocess.Popen(
         [QEMU, "-L", ROOTFS, REHOST, DEV["uid"], username,
          DEV["password"], "1", str(OPT["stream"]), "86400"],
         cwd=rundir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env={**os.environ, "LD_LIBRARY_PATH": BINDIR})
+    branch_isolate(br, cap.pid)
     ff = subprocess.Popen(
         [FFMPEG, "-hide_banner", "-loglevel", "error",
          "-probesize", "32", "-f", "hevc", "-i", "pipe:0",
@@ -1781,56 +1854,58 @@ def run_pipeline():
          "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL)
-    PIPE["cap"], PIPE["ff"] = cap, ff
-    threading.Thread(target=split_jpegs, args=(ff,), daemon=True).start()
+    br["PIPE"]["cap"], br["PIPE"]["ff"] = cap, ff
+    threading.Thread(target=split_jpegs, args=(ff, br),
+                     daemon=True).start()
     try:
-        os.makedirs(HLSDIR, exist_ok=True)
-        for f in glob.glob(os.path.join(HLSDIR, "*")):
+        os.makedirs(hlsdir, exist_ok=True)
+        for f in glob.glob(os.path.join(hlsdir, "*")):
             try:
                 os.remove(f)
             except OSError:
                 pass
-        fifo = os.path.join(HLSDIR, "in.hevc")
+        fifo = os.path.join(hlsdir, "in.hevc")
         try:
             os.remove(fifo)
         except OSError:
             pass
         os.mkfifo(fifo)
-        hlslog = open(os.path.join(HLSDIR, "ffmpeg-hls.log"), "wb")
-        PIPE["hlslog"] = hlslog
+        hlslog = open(os.path.join(hlsdir, "ffmpeg-hls.log"), "wb")
+        br["PIPE"]["hlslog"] = hlslog
         fhls = subprocess.Popen(
             [FFMPEG, "-hide_banner", "-loglevel", "warning",
              "-r", "30", "-f", "hevc", "-i", fifo,
              "-c", "copy", "-f", "hls", "-hls_time", "2",
              "-hls_list_size", "6", "-hls_flags", "delete_segments",
              "-hls_segment_filename", "seg%d.ts", "index.m3u8"],
-            cwd=HLSDIR, stdout=subprocess.DEVNULL,
+            cwd=hlsdir, stdout=subprocess.DEVNULL,
             stderr=hlslog)
-        PIPE["hls"] = fhls
-        PRIME["on"] = False
-        PRIME["nxt"] = 0
-        threading.Thread(target=live_hls_feeder, args=(rundir, fifo),
+        br["PIPE"]["hls"] = fhls
+        br["PRIME"]["on"] = False
+        br["PRIME"]["nxt"] = 0
+        threading.Thread(target=live_hls_feeder, args=(rundir, fifo, br),
                          daemon=True).start()
     except (OSError, AttributeError) as e:
-        print("live HLS off: %s" % str(e)[:80], flush=True)
-        PIPE["hls"] = None
+        print("branch %s live HLS off: %s" % (br["name"], str(e)[:80]),
+              flush=True)
+        br["PIPE"]["hls"] = None
     with LOCK:
-        ST["running"] = True
-        ST["spawns"] += 1
-        ST["hls_n"] = 0
-        ST["hls_bytes"] = 0
-        ST["hls_err"] = ""
-    print("pipeline spawned", flush=True)
+        br["ST"]["running"] = True
+        br["ST"]["spawns"] += 1
+        br["ST"]["hls_n"] = 0
+        br["ST"]["hls_bytes"] = 0
+        br["ST"]["hls_err"] = ""
+    print("branch %s pipeline spawned" % br["name"], flush=True)
     nxt, primed = 0, False
     try:
         while True:
-            if PIPE["cap"] is None:
+            if br["PIPE"]["cap"] is None:
                 break
             path = os.path.join(rundir, "v_%d.bin" % nxt)
             if not os.path.isfile(path):
                 if cap.poll() is not None:
-                    print("rehost exited rc=%s" % cap.returncode,
-                          flush=True)
+                    print("branch %s rehost exited rc=%s"
+                          % (br["name"], cap.returncode), flush=True)
                     break
                 time.sleep(0.15)
                 continue
@@ -1843,35 +1918,37 @@ def run_pipeline():
                     nxt += 1
                     continue
                 primed = True
-                PRIME["on"] = True
-                PRIME["nxt"] = nxt
+                br["PRIME"]["on"] = True
+                br["PRIME"]["nxt"] = nxt
             try:
                 ff.stdin.write(b)
                 with LOCK:
-                    ST["nals"] += 1
+                    br["ST"]["nals"] += 1
             except (BrokenPipeError, ValueError):
                 with LOCK:
-                    ST["restarts"] += 1
+                    br["ST"]["restarts"] += 1
                 break
             nxt += 1
     finally:
-        stop_pipeline()
-        print("pipeline stopped", flush=True)
+        stop_pipeline(br)
+        print("branch %s pipeline stopped" % br["name"], flush=True)
 
 
-def supervisor():
+def supervisor(br):
     while True:
-        WAKE.wait(timeout=5)
-        WAKE.clear()
+        br["WAKE"].wait(timeout=5)
+        br["WAKE"].clear()
         with LOCK:
-            subs = ST["subs"]
-            running = ST["running"]
-            idle_for = time.time() - ST["last_sub_t"]
+            subs = br["ST"]["subs"]
+            running = br["ST"]["running"]
+            idle_for = time.time() - br["ST"]["last_sub_t"]
         if subs > 0 and not running:
-            threading.Thread(target=run_pipeline, daemon=True).start()
+            threading.Thread(target=run_pipeline, args=(br,),
+                             daemon=True).start()
         elif subs == 0 and running and idle_for > OPT["idle_timeout"]:
-            print("idle %.0fs, stopping pipeline" % idle_for, flush=True)
-            stop_pipeline()
+            print("branch %s idle %.0fs, stopping pipeline"
+                  % (br["name"], idle_for), flush=True)
+            stop_pipeline(br)
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -2045,7 +2122,7 @@ button.on{outline:2px solid #2a6}
 <div class="tabpage" id="tab-doc">
 <h2 style="margin-top:0">接口</h2>
 <div class="card">
-   <div>本机接口：/api/login /api/logout /api/session /api/devices（含sd透传） /api/device /api/device-login /api/device/webrtc_token /api/cloud/list /api/cloud/url /api/sd/list（P2P直连0x101查SD，secs最多等待15~90s、有回包提前返回） /api/sd/list_live（查询中途看已到条目，动态显示用） /api/sess/connect /api/sess/disconnect /api/sess/status（手动建联开关+状态，SD列表优先走会话） /api/sd/vod /api/sd/vod_status /api/sd/vod_file（AVCMD command=9点播转mp4） /api/settings /api/transport /stats /snap.jpg /video.mjpg /api/live/hls（直播HLS分片）</div>
+   <div>本机接口：/api/login /api/logout /api/session /api/devices（含sd透传） /api/device /api/device-login /api/device/webrtc_token /api/cloud/list /api/cloud/url /api/sd/list（P2P直连0x101查SD，secs最多等待15~90s、有回包提前返回） /api/sd/list_live（查询中途看已到条目，动态显示用） /api/sess/connect /api/sess/disconnect /api/sess/status（手动建联开关+状态，SD列表优先走会话） /api/sd/vod /api/sd/vod_status /api/sd/vod_file（AVCMD command=9点播转mp4） /api/settings /api/transport /stats /snap.jpg /video.mjpg（主备合并） /video1.mjpg（直连分支） /video2.mjpg（中继分支） /api/live/start?branch=1|2 /api/live/stop?branch=1|2|all /api/live/hls（直播HLS分片，跟分支1）</div>
   <div class="muted" style="margin-top:6px">设备密码与云密码只进容器 /data，不进配置不进仓库。直播推流暂未接入，页面先行。</div>
 </div>
 </div><!-- /tab-doc -->
@@ -2554,19 +2631,20 @@ function startStream(kind,n){
     return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stream:n})});
   }).then(function(r){
     if(!r)return null;
-    return fetch('/api/transport?mode='+kind,{method:'POST'});
+    var bid=isDirect?'1':'2';
+    return fetch('/api/live/start?branch='+bid,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stream:n})});
   }).then(function(r){
     if(!r)return;
     return r.json();
   }).then(function(d){
     if(!d)return;
     fmsg(modeName+(n===1?'主':'辅')+'取流中…',true);
-    llog(kind,'transport='+d.mode+' 生效='+d.applied+' '+d.detail);
+    llog(kind,'branch='+d.branch+'('+d.name+') transport='+d.transport+' running='+d.running);
     llog(kind,modeName+(n===1?'主':'辅')+'取流中，等待首帧（约10~30秒）…');
     if(isDirect){_directWanted=true;}else{_relayWanted=true;}
     switchTab(tab);
     var v=document.getElementById(imgId);
-    if(v)v.src='/video.mjpg?ts='+Date.now();
+    if(v)v.src=(isDirect?'/video1.mjpg':'/video2.mjpg')+'?ts='+Date.now();
   }).catch(function(e){fmsg('启动失败');llog(kind,'启动失败: '+e);});
 }
 function stopLan(){stopStream('direct');}
@@ -2574,7 +2652,8 @@ function stopRelay(){stopStream('relay');}
 function stopStream(kind){
   var isDirect=(kind==='direct');
   if(isDirect){_directWanted=false;}else{_relayWanted=false;}
-  fetch('/api/pipeline-stop',{method:'POST'}).then(function(){}).catch(function(){});
+  var bid=isDirect?'1':'2';
+  fetch('/api/live/stop?branch='+bid,{method:'POST'}).then(function(){}).catch(function(){});
   llog(kind,'已停止（管线已掐断）');
   var v=document.getElementById('live-img');
   if(v)v.src='about:blank';
@@ -3087,7 +3166,7 @@ function switchTab(name){
   var lv=document.getElementById('live-img');
   if(lv){
     if(name==='live'){
-      if(_directWanted&&!lv.getAttribute('src'))lv.src='/video.mjpg';
+      if(_directWanted&&!lv.getAttribute('src'))lv.src='/video1.mjpg';
     }else{
       lv.src='about:blank';
     }
@@ -3095,7 +3174,7 @@ function switchTab(name){
   var ri=document.getElementById('relay-img');
   if(ri){
     if(name==='relaylive'){
-      if(_relayWanted&&!ri.getAttribute('src'))ri.src='/video.mjpg';
+      if(_relayWanted&&!ri.getAttribute('src'))ri.src='/video2.mjpg';
     }else{
       ri.src='about:blank';
     }
@@ -3243,8 +3322,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _query_key_ok(self):
         # 浏览器会剥掉 URL 里嵌的 user:pass@，但 query 会原样送达：
-        # /video.mjpg?key=<http_password> 免弹框直开即唤醒即播。
-        # 只放行两个只读流端点，页面与 API 照旧走 Basic。
+        # /video*.mjpg?key=<http_password> /snap.jpg?key=… 免弹框直开。
+        # 只放行只读流端点，页面与 API 照旧走 Basic。
         want_p = OPT.get("http_password", "")
         if not want_p:
             return False
@@ -3274,10 +3353,59 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_mjpeg(self, bids):
+        # bids: subscribe these branches, serve the freshest frame seen
+        # on any of them (主备合并). Single-element list = pure branch.
+        for bid in bids:
+            br = BR[bid]
+            with LOCK:
+                br["ST"]["subs"] += 1
+                br["ST"]["last_sub_t"] = time.time()
+            br["WAKE"].set()
+        try:
+            bnd = "uboxlive"
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "multipart/x-mixed-replace; boundary=" + bnd)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            last = (None, -1)
+            while True:
+                if client_gone(self.connection):
+                    break
+                with LOCK:
+                    cands = [(BR[b]["LATEST"]["t"], BR[b]["LATEST"]["seq"],
+                              BR[b]["LATEST"]["jpg"], b) for b in bids]
+                    for b in bids:
+                        BR[b]["ST"]["last_sub_t"] = time.time()
+                cands = [c for c in cands if c[2] is not None]
+                if cands:
+                    t, seq, jpg, bid = max(cands)
+                    if (bid, seq) != last:
+                        head = ("--%s\r\nContent-Type: image/jpeg\r\n"
+                                "Content-Length: %d\r\n\r\n"
+                                % (bnd, len(jpg))).encode()
+                        self.wfile.write(head + jpg + b"\r\n")
+                        last = (bid, seq)
+                        with LOCK:
+                            BR[bid]["ST"]["served"] += 1
+                time.sleep(0.1)
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            pass
+        finally:
+            with LOCK:
+                for bid in bids:
+                    br = BR[bid]
+                    br["ST"]["subs"] = max(0, br["ST"]["subs"] - 1)
+                    br["ST"]["last_sub_t"] = time.time()
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if not self._auth_ok() and not (
-                path in ("/video.mjpg", "/snap.jpg")
+                path in ("/video.mjpg", "/video1.mjpg", "/video2.mjpg",
+                         "/snap.jpg")
                 and self._query_key_ok()):
             self._deny_auth()
             return
@@ -3450,19 +3578,45 @@ class Handler(BaseHTTPRequestHandler):
                                 OPT.get("http_password"))}).encode())
         elif path == "/stats":
             with LOCK:
-                snap = dict(ST)
-                snap["last_age_ms"] = (
-                    int((time.time() - LATEST["t"]) * 1000)
-                    if LATEST["t"] else None)
+                s1, s2 = dict(BR["1"]["ST"]), dict(BR["2"]["ST"])
+                t1, t2 = BR["1"]["LATEST"]["t"], BR["2"]["LATEST"]["t"]
                 tr = dict(TR)
-            snap["uptime_s"] = int(time.time() - snap.pop("t0"))
-            snap.pop("last_sub_t", None)
+            now = time.time()
+
+            def _br(bid, st, jt):
+                br = BR[bid]
+                return {"transport": br["transport"],
+                        "running": st["running"], "spawns": st["spawns"],
+                        "decoded": st["decoded"], "subs": st["subs"],
+                        "served": st["served"],
+                        "frame_age_ms": (int((now - jt) * 1000)
+                                         if jt else None),
+                        "isolation": br["iso"], "pid": br.get("pid"),
+                        "hls_n": st["hls_n"], "hls_bytes": st["hls_bytes"],
+                        "hls_err": st["hls_err"]}
+
+            branches = {"video1": _br("1", s1, t1),
+                        "video2": _br("2", s2, t2)}
+            snap = {"decoded": s1["decoded"] + s2["decoded"],
+                    "nals": s1["nals"] + s2["nals"],
+                    "restarts": s1["restarts"] + s2["restarts"],
+                    "spawns": s1["spawns"] + s2["spawns"],
+                    "running": s1["running"] or s2["running"],
+                    "served": s1["served"] + s2["served"],
+                    "subs": s1["subs"] + s2["subs"],
+                    "hls_n": s1["hls_n"], "hls_bytes": s1["hls_bytes"],
+                    "hls_err": s1["hls_err"]}
+            jt = max(t1, t2)
+            snap["last_age_ms"] = (int((now - jt) * 1000) if jt else None)
+            snap["uptime_s"] = int(now - min(s1["t0"], s2["t0"]))
             snap["fps"] = OPT["fps"]
             snap["transport"] = tr["mode"]
             snap["transport_applied"] = tr["applied"]
             snap["transport_detail"] = tr["detail"]
-            snap["live_hls"] = {"ready": _live_hls_ready(),
-                                "segs": _live_hls_segs(),
+            snap["branches"] = branches
+            snap["live_hls"] = {"ready": _live_hls_ready(
+                                    BR["1"]["hlsdir"]),
+                                "segs": _live_hls_segs(BR["1"]["hlsdir"]),
                                 "n": snap["hls_n"], "bytes": snap["hls_bytes"],
                                 "err": snap["hls_err"]}
             snap["sess"] = sess_status()
@@ -3470,51 +3624,25 @@ class Handler(BaseHTTPRequestHandler):
                        json.dumps(snap).encode())
         elif path == "/snap.jpg":
             with LOCK:
-                jpg = LATEST["jpg"]
-            if not jpg:
+                cands = [(BR[b]["LATEST"]["t"], BR[b]["LATEST"]["jpg"])
+                         for b in ("1", "2")]
+            cands = [(t, j) for t, j in cands if j is not None]
+            if not cands:
                 self._send(404, "text/plain", b"no frame yet")
                 return
-            self._send(200, "image/jpeg", jpg)
-        elif path == "/video.mjpg":
+            self._send(200, "image/jpeg", max(cands)[1])
+        elif path in ("/video.mjpg", "/video1.mjpg", "/video2.mjpg"):
             if not DEV["uid"] or not DEV["password"]:
                 self._send(503, "text/plain",
                            b"device not configured (enter on web page)")
                 return
-            with LOCK:
-                ST["subs"] += 1
-                ST["last_sub_t"] = time.time()
-            WAKE.set()
-            try:
-                bnd = "uboxlive"
-                self.send_response(200)
-                self.send_header(
-                    "Content-Type",
-                    "multipart/x-mixed-replace; boundary=" + bnd)
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                last = -1
-                while True:
-                    if client_gone(self.connection):
-                        break
-                    with LOCK:
-                        seq, jpg = LATEST["seq"], LATEST["jpg"]
-                        ST["last_sub_t"] = time.time()
-                    if jpg is not None and seq != last:
-                        head = ("--%s\r\nContent-Type: image/jpeg\r\n"
-                                "Content-Length: %d\r\n\r\n"
-                                % (bnd, len(jpg))).encode()
-                        self.wfile.write(head + jpg + b"\r\n")
-                        last = seq
-                        with LOCK:
-                            ST["served"] += 1
-                    time.sleep(0.1)
-            except (BrokenPipeError, ConnectionResetError,
-                    ConnectionAbortedError):
-                pass
-            finally:
-                with LOCK:
-                    ST["subs"] = max(0, ST["subs"] - 1)
-                    ST["last_sub_t"] = time.time()
+            if path == "/video1.mjpg":
+                self._serve_mjpeg(["1"])
+            elif path == "/video2.mjpg":
+                self._serve_mjpeg(["2"])
+            else:
+                # 主备合并：两路都订阅，逐帧取最新鲜者
+                self._serve_mjpeg(["1", "2"])
         elif path == "/api/sd/list_live":
             self._send(200, "application/json",
                        json.dumps(read_sd_live()).encode())
@@ -3538,7 +3666,7 @@ class Handler(BaseHTTPRequestHandler):
                     or "/" in fn or "\\" in fn):
                 self._send(400, "text/plain", b"bad hls request")
                 return
-            fp = os.path.join(HLSDIR, fn)
+            fp = os.path.join(BR["1"]["hlsdir"], fn)
             if not (os.path.isfile(fp) and os.path.getsize(fp) > 0):
                 self._send(404, "text/plain", b"hls not ready")
                 return
@@ -3723,8 +3851,8 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("http_password") is not None:
                 OPT["http_password"] = str(body["http_password"] or "")
             _save_settings()
-            stop_pipeline()
-            WAKE.set()
+            _stop_all_branches()
+            _wake_all_branches()
             self._send(200, "application/json",
                        json.dumps({"ok": True, "restarted": True}).encode())
             return
@@ -3791,9 +3919,50 @@ class Handler(BaseHTTPRequestHandler):
                        json.dumps(data).encode())
             return
         if path == "/api/pipeline-stop":
-            stop_pipeline()
+            _stop_all_branches()
             self._send(200, "application/json",
                        json.dumps({"ok": True, "running": False}).encode())
+            return
+        if path == "/api/live/start":
+            # 分支启流：video1=直连优先，video2=中继。各分支 transport 固定，
+            # 不再动全局 transport（分支起流会自动清掉冲突的全局规则）。
+            bid = q.get("branch", "1")
+            if bid not in BR:
+                self._send(400, "application/json",
+                           json.dumps({"error": "branch must be 1 or 2"}
+                                      ).encode())
+                return
+            body = self._read_json()
+            try:
+                n = int(body.get("stream", OPT["stream"]))
+            except (TypeError, ValueError):
+                n = OPT["stream"]
+            OPT["stream"] = n
+            _save_settings()
+            br = BR[bid]
+            br["WAKE"].set()
+            with LOCK:
+                st = dict(br["ST"])
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "branch": bid,
+                                   "name": br["name"],
+                                   "transport": br["transport"],
+                                   "stream": n,
+                                   "running": st["running"]}).encode())
+            return
+        if path == "/api/live/stop":
+            bid = q.get("branch", "all")
+            if bid == "all":
+                _stop_all_branches()
+            elif bid in BR:
+                stop_pipeline(BR[bid])
+            else:
+                self._send(400, "application/json",
+                           json.dumps({"error": "branch must be 1, 2 or all"}
+                                      ).encode())
+                return
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "branch": bid}).encode())
             return
         if path == "/api/sd/list":
             # SD list goes P2P direct to the device (0x101 via
@@ -3966,8 +4135,8 @@ class Handler(BaseHTTPRequestHandler):
             DEV["username"] = username
             DEV["password"] = password
             _save_device()
-            stop_pipeline()
-            WAKE.set()
+            _stop_all_branches()
+            _wake_all_branches()
             self._send(200, "application/json",
                        json.dumps({"ok": True, "uid": uid,
                                    "username": username,
@@ -3997,8 +4166,8 @@ class Handler(BaseHTTPRequestHandler):
                 persisted, perr = False, str(e)
             OPT["transport"] = mode
             ok = apply_transport(mode)
-            stop_pipeline()
-            WAKE.set()
+            _stop_all_branches()
+            _wake_all_branches()
             with LOCK:
                 tr = dict(TR)
             self._send(200, "application/json",
@@ -4024,7 +4193,9 @@ def main():
         ("set" if (DEV["uid"] and DEV["password"]) else "empty")),
         flush=True)
     apply_transport(OPT["transport"])
-    threading.Thread(target=supervisor, daemon=True).start()
+    for br in BR.values():
+        threading.Thread(target=supervisor, args=(br,),
+                         daemon=True).start()
     threading.Thread(target=sess_supervisor, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", OPT["port"]), Handler)
     print("serving on :%d" % OPT["port"], flush=True)
