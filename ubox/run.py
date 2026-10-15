@@ -61,11 +61,20 @@ def load_options():
     opt = {"username": "admin",
            "stream": 1, "fps": 8, "port": 8089, "idle_timeout": 60,
            "transport": "auto", "http_username": "ubox", "http_password": ""}
+    file_opt = {}
     try:
         with open(OPTFILE, encoding="utf-8") as fh:
-            opt.update(json.load(fh))
-    except OSError:
+            file_opt = json.load(fh) or {}
+            if not isinstance(file_opt, dict):
+                file_opt = {}
+            opt.update(file_opt)
+    except (OSError, ValueError):
         pass
+    # HASS 配置页是 http 鉴权的权威来源：文件里显式带了就记住，
+    # _load_settings() 之后再覆盖一次（见 _load_settings() 调用处）。
+    opt["_hass_http"] = {k: file_opt[k] for k in
+                         ("http_username", "http_password")
+                         if isinstance(file_opt.get(k), str)}
     # Runtime choice from the web button survives restarts; it wins over
     # the supervisor-managed options.json until the user changes config.
     try:
@@ -924,6 +933,11 @@ def _load_settings():
 
 
 _load_settings()
+
+# HASS 配置页优先：用户在“配置”页改了页面账密，重启后以它为准
+#（页面内改的仍写入 settings.json，但下次重启会被配置页覆盖）。
+for _k, _v in OPT.pop("_hass_http", {}).items():
+    OPT[_k] = _v
 
 
 def _ipt(*args):
